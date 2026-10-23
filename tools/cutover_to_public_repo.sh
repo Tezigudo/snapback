@@ -14,16 +14,21 @@
 #                             --excludes <file> [--apply]
 #   cutover_to_public_repo.sh --rollback <aside-dir>
 #
-# Default is a DRY RUN: read-only except that `git fetch` stores objects in
-# .git (no refs/remotes/config are changed). The dry run still fetches with the
-# new deploy key, proves the equivalence, and runs --check-config + the cron
-# imports against an exported copy of the new tree.
+# Default is a DRY RUN. Its only write to the repo: a ref-less fetch
+# (`git ls-remote` for the tip, then `git fetch --no-write-fetch-head`) that
+# adds git objects under .git/objects — no ref, no FETCH_HEAD, no config, no
+# working-tree change. It fetches with the new deploy key, proves the
+# equivalence, and runs --check-config + the cron imports against an exported
+# copy of the new tree (in a temp dir that is deleted).
+#
+# --apply and --rollback refuse to run outside tmux/screen (an ssh drop would
+# otherwise SIGHUP the script mid-switch) unless --no-tmux-ok is passed.
 #
 # Environment (defaults suit the droplet):
 #   REPO=/root/snapback-btc
 #   PUBLIC_URL=git@github-snapback:Tezigudo/snapback.git   (remote URL to store)
 #   FETCH_URL=git@github.com:Tezigudo/snapback.git          (dry-run fetch URL)
-#   DEPLOY_KEY=$HOME/.ssh/gh_deploy_snapback
+#   DEPLOY_KEY=<passwd home>/.ssh/gh_deploy_snapback
 #   SSH_ALIAS=github-snapback
 #   PYTHON=$REPO/.venv/bin/python
 #   ASIDE_ROOT=$HOME                  aside dir = $ASIDE_ROOT/cutover-aside-<ts>
@@ -46,16 +51,19 @@ RUNTIME_DIRS=(data logs reports)   # units' ReadWritePaths — must exist
 REPO="${REPO:-/root/snapback-btc}"
 PUBLIC_URL="${PUBLIC_URL:-git@github-snapback:Tezigudo/snapback.git}"
 FETCH_URL="${FETCH_URL:-git@github.com:Tezigudo/snapback.git}"
-DEPLOY_KEY="${DEPLOY_KEY:-$HOME/.ssh/gh_deploy_snapback}"
+# passwd home of the effective user (ssh reads ~/.ssh/config from there, not $HOME)
+USER_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+[[ -n "$USER_HOME" ]] || USER_HOME="$(eval echo "~$(id -un)")"   # macOS (sim): no getent
+DEPLOY_KEY="${DEPLOY_KEY:-$USER_HOME/.ssh/gh_deploy_snapback}"
 SSH_ALIAS="${SSH_ALIAS:-github-snapback}"
-SSH_CONFIG="$HOME/.ssh/config"
+SSH_CONFIG="$USER_HOME/.ssh/config"
 PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
-ASIDE_ROOT="$(cd "${ASIDE_ROOT:-$HOME}" && pwd)"
+ASIDE_ROOT="$(cd "${ASIDE_ROOT:-$USER_HOME}" && pwd)"
 SIM="${SIM:-0}"
 SKIP_PY_CHECKS="${SKIP_PY_CHECKS:-0}"
 FAIL_AFTER="${CUTOVER_FAIL_AFTER:-}"
 
-APPLY=0; ROLLBACK_DIR=""; PRIV_SHA=""; PUB_SHA=""; EXCLUDES=""
+APPLY=0; NO_TMUX_OK=0; ROLLBACK_DIR=""; PRIV_SHA=""; PUB_SHA=""; EXCLUDES=""
 ASIDE=""; APPLY_STARTED=0; DONE=0; FAILS=0
 
 # ------------------------------------------------------------------ helpers --
@@ -73,7 +81,7 @@ state_get() { sed -n "s/^$1=//p" "$2/state" | tail -1; }
 is_full_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 ssh_cmd() { printf 'ssh -F /dev/null -i %q -o IdentitiesOnly=yes -o BatchMode=yes' "$DEPLOY_KEY"; }
 
-usage() { sed -n '2,35p' "$0"; exit 2; }
+usage() { sed -n '2,40p' "$0"; exit 2; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,6 +89,7 @@ while [[ $# -gt 0 ]]; do
     --public-sha)  PUB_SHA="$2";  shift 2 ;;
     --excludes)    EXCLUDES="$2"; shift 2 ;;
     --apply)       APPLY=1; shift ;;
+    --no-tmux-ok)  NO_TMUX_OK=1; shift ;;
     --rollback)    ROLLBACK_DIR="$2"; shift 2 ;;
     -h|--help)     usage ;;
     *) die "unknown argument: $1" ;;
@@ -92,21 +101,29 @@ done
 # byte-identical). data/ logs/ reports/ are written by the RUNNING bots every
 # tick, so their hashes legitimately move: for those we assert existence +
 # same inode (git never rewrites ignored files; the real risk is deletion).
+# Paths the running bots/cron create, delete or atomically replace on their
+# own (SQLite WAL/SHM/journal per connection, heartbeats, temp files, log
+# rotation, bytecode). They are excluded from every before/after comparison —
+# a manifest that includes them fails on a healthy box and triggers rollback.
+TRANSIENT_RE='(-wal|-shm|-journal|\.tmp|\.pyc)$|(^|/)heartbeat[^/]*$|(^|/)__pycache__(/|$)|^logs/|(^|/)\.[^/]*\.tmp$'
+not_transient() { grep -vE "$TRANSIENT_RE" || true; }
+
 build_manifest() {   # $1 = output prefix
   local out="$1"
   ( cd "$REPO"
     : > "$out.strict"; : > "$out.inode"
+    # byte-identical: secrets, params (+ .bak), mainnet lock — any NON-tracked copy
     for f in .env* config/params*.yaml* confirm_mainnet.lock; do
-      [[ -f "$f" ]] && git check-ignore -q "$f" && sha "$f" >> "$out.strict" || true
+      [[ -f "$f" ]] && ! git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 \
+        && sha "$f" >> "$out.strict" || true
     done
-    while IFS= read -r -d '' f; do
-      [[ -f "$f" ]] || continue
-      case "$f" in .env*|config/params*|confirm_mainnet.lock) continue ;; esac
-      printf '%s\t%s\n' "$(inode "$f")" "$f" >> "$out.inode"
-    done < <(git ls-files -z -o -i --exclude-standard -- data logs reports archive)
-    # every ignored entry (dirs collapsed: .venv/, __pycache__/, archive/ ...)
-    git ls-files -o -i --exclude-standard --directory | LC_ALL=C sort > "$out.ignored"
-    git ls-files -o --exclude-standard | LC_ALL=C sort > "$out.untracked"
+    # existence + same inode: SQLite DBs (written live, so content moves; never replaced)
+    for f in data/*.db data/**/*.db; do
+      [[ -f "$f" ]] && printf '%s\t%s\n' "$(inode "$f")" "$f" >> "$out.inode" || true
+    done
+    # presence only: every other ignored / untracked entry minus transients
+    git ls-files -o -i --exclude-standard --directory | not_transient | LC_ALL=C sort -u > "$out.ignored"
+    git ls-files -o --exclude-standard | not_transient | LC_ALL=C sort -u > "$out.untracked"
   )
 }
 
@@ -123,9 +140,9 @@ compare_manifests() {   # $1 = before prefix, $2 = after prefix
   fi
   missing="$(LC_ALL=C comm -23 <(LC_ALL=C sort "$b.inode") <(LC_ALL=C sort "$a.inode") || true)"
   if [[ -z "$missing" ]]; then
-    info "OK  runtime files (data/logs/reports) all present, same inode ($(wc -l < "$b.inode" | tr -d ' ') files)"
+    info "OK  SQLite DBs all present, same inode ($(wc -l < "$b.inode" | tr -d ' ') files)"
   else
-    fail "runtime files missing or replaced:"; printf '%s\n' "$missing" >&2
+    fail "SQLite DBs missing or replaced:"; printf '%s\n' "$missing" >&2
   fi
   missing="$(LC_ALL=C comm -23 "$b.ignored" "$a.ignored" || true)"
   [[ -z "$missing" ]] && info "OK  all $(wc -l < "$b.ignored" | tr -d ' ') ignored entries still present" \
@@ -291,6 +308,11 @@ rollback() {   # $1 = aside dir; best effort, every step reported
   local pub_added; pub_added="$(state_get PUBLIC_ADDED "$a")"
   [[ -n "$REPO" && -d "$REPO/.git" ]] || { echo "[cutover] rollback: bad state file" >&2; return 1; }
 
+  if [[ -e "$REPO/.git/index.lock" ]]; then
+    if pgrep -x git >/dev/null 2>&1; then
+      echo "[cutover] rollback: .git/index.lock present AND a git process is running — not touching it" >&2; rc=1
+    else run rm -f "$REPO/.git/index.lock"; fi
+  fi
   if [[ "$(g symbolic-ref -q --short HEAD)" != droplet ]]; then
     run g checkout -q droplet || { echo "[cutover] rollback: checkout droplet FAILED — fix by hand" >&2; rc=1; }
   fi
@@ -351,7 +373,18 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM HUP
 
+require_tmux() {
+  [[ -n "${TMUX:-}" || -n "${STY:-}" || $NO_TMUX_OK -eq 1 ]] && return 0
+  printf '\n[cutover] ************************************************************\n' >&2
+  printf '[cutover] *  RUN THIS INSIDE tmux/screen: an ssh drop mid-switch would  *\n' >&2
+  printf '[cutover] *  SIGHUP the script. `tmux new -s cutover`, then re-run.      *\n' >&2
+  printf '[cutover] *  (override: --no-tmux-ok)                                    *\n' >&2
+  printf '[cutover] ************************************************************\n\n' >&2
+  exit 1
+}
+
 if [[ -n "$ROLLBACK_DIR" ]]; then
+  require_tmux
   [[ -f "$ROLLBACK_DIR/state" ]] || die "no state file in $ROLLBACK_DIR"
   ROLLBACK_DIR="$(cd "$ROLLBACK_DIR" && pwd)"
   rollback "$ROLLBACK_DIR"; exit $?
@@ -365,12 +398,19 @@ EXCLUDES="$(cd "$(dirname "$EXCLUDES")" && pwd)/$(basename "$EXCLUDES")"
 
 step "$([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)  repo=$REPO  private=${PRIV_SHA:0:7}  public=${PUB_SHA:0:7}  sim=$SIM"
 
+[[ $APPLY -eq 1 ]] && require_tmux
+[[ -n "${TMUX:-}" || -n "${STY:-}" ]] || info "WARN not inside tmux/screen — fine for a dry run; --apply will refuse"
+
 step "1. preflight"
 [[ -d "$REPO/.git" ]] || die "$REPO is not a git checkout"
+[[ -e "$REPO/.git/index.lock" ]] && die ".git/index.lock exists — another git process running (or crashed); investigate first"
 [[ "$(g symbolic-ref -q --short HEAD)" == droplet ]] || die "branch is not 'droplet'"
 [[ "$(g rev-parse HEAD)" == "$PRIV_SHA" ]] || die "HEAD $(g rev-parse --short HEAD) != expected ${PRIV_SHA:0:7}"
 g diff --quiet && g diff --cached --quiet || die "tracked modifications present — refusing"
-info "OK  branch droplet @ ${PRIV_SHA:0:7}, no tracked modifications"
+flagged="$(g ls-files -v | grep -E '^[a-zS]' | head -5 || true)"
+[[ -z "$flagged" ]] || die "tracked files carry assume-unchanged/skip-worktree bits (hidden edits) — refusing:
+$flagged"
+info "OK  branch droplet @ ${PRIV_SHA:0:7}, no tracked modifications, no assume-unchanged/skip-worktree"
 g show-ref -q --verify refs/heads/master && die "a local 'master' branch already exists — refusing"
 g remote get-url private >/dev/null 2>&1 && die "a remote named 'private' already exists — refusing"
 g remote get-url origin >/dev/null 2>&1 || die "no 'origin' remote"
@@ -394,13 +434,12 @@ fi
 ASIDE_TMP="$(mktemp -d)"; EXPORT_DIR="$ASIDE_TMP"
 ASIDE="$ASIDE_TMP"   # dry-run scratch; real aside created on --apply
 
-step "2. fetch public master (no refs/config changed) and pin ${PUB_SHA:0:7}"
-if [[ -n "$GIT_SSH_FOR_FETCH" ]]; then
-  run env GIT_SSH_COMMAND="$GIT_SSH_FOR_FETCH" git -C "$REPO" fetch -q --no-tags "$FETCH_URL" master
-else
-  run g fetch -q --no-tags "$FETCH_URL" master
-fi
-TIP="$(g rev-parse FETCH_HEAD)"
+step "2. ref-less fetch of public master (objects only: no ref, no FETCH_HEAD, no config) and pin ${PUB_SHA:0:7}"
+GSSH="${GIT_SSH_FOR_FETCH:-ssh -o BatchMode=yes}"
+TIP="$(env GIT_SSH_COMMAND="$GSSH" git -C "$REPO" ls-remote "$FETCH_URL" refs/heads/master | awk '{print $1}')"
+is_full_sha "$TIP" || die "could not read public master via ls-remote (deploy key not added to the repo?)"
+run env GIT_SSH_COMMAND="$GSSH" git -C "$REPO" fetch -q --no-tags --no-write-fetch-head "$FETCH_URL" master
+g cat-file -e "$TIP^{commit}" 2>/dev/null || die "public master moved during fetch — re-run"
 g cat-file -e "$PUB_SHA^{commit}" 2>/dev/null || die "expected public sha not present after fetch"
 g merge-base --is-ancestor "$PUB_SHA" "$TIP" || die "expected public sha is not on public/master"
 info "OK  public/master tip ${TIP:0:7}; pinned ${PUB_SHA:0:7} is on it$([[ $TIP != "$PUB_SHA" ]] && echo ' (tip has newer commits — they are NOT applied here)')"
@@ -472,7 +511,7 @@ maybe_fail ssh
 
 step "5b. add + fetch remote 'public'"
 if [[ $PUBLIC_PREEXISTS -eq 0 ]]; then run g remote add public "$PUBLIC_URL"; state_set PUBLIC_ADDED 1; fi
-run env GIT_SSH_COMMAND="ssh -o BatchMode=yes" git -C "$REPO" fetch -q --no-tags public master
+run env GIT_SSH_COMMAND="ssh -o BatchMode=yes" git -C "$REPO" fetch -q --no-tags --no-write-fetch-head public master
 g merge-base --is-ancestor "$PUB_SHA" refs/remotes/public/master || die "pinned sha not on public/master via the alias remote"
 info "OK  fetched via $PUBLIC_URL"
 maybe_fail remote
