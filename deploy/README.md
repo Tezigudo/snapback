@@ -9,7 +9,7 @@ sudo mkdir -p /opt/snapback-btc /etc/snapback-btc /var/log/snapback-btc
 sudo chown -R snapback:snapback /opt/snapback-btc /var/log/snapback-btc
 sudo chown root:snapback /etc/snapback-btc && sudo chmod 750 /etc/snapback-btc
 
-git clone https://github.com/Tezigudo/snapback-btc /opt/snapback-btc
+git clone https://github.com/Tezigudo/snapback /opt/snapback-btc
 cd /opt/snapback-btc
 python3.11 -m venv .venv
 .venv/bin/pip install -e .

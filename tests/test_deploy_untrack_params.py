@@ -110,7 +110,7 @@ def env(tmp_path):
     (sd / "active_snapback-sol-be.timer").write_text("active\n")
     (sd / "active_unrelated.timer").write_text("active\n")
     (sd / "crontab").write_text("*/2 * * * * watchdog\n")
-    e = dict(os.environ, REPO=str(repo), TARGET="origin/target", FETCH="0",
+    e = dict(os.environ, REPO=str(repo), TARGET="origin/target", BRANCH="droplet", FETCH="0",
              ASIDE_ROOT=str(tmp_path / "aside"), PYTHON=str(PYTHON),
              SYSTEMCTL=str(shim / "systemctl"), UNIT_DIR=str(units), TAR=str(shim / "faketar"),
              FAKE_SD=str(sd), FAKE_UNIT_DIR=str(units), PATH=f"{shim}:{os.environ['PATH']}")

@@ -14,8 +14,8 @@ Deterministic Binance Futures BTC/USDT perpetual bot. RSI(2) extreme + EMA(200) 
 
 ## Quickstart (testnet)
 ```bash
-git clone https://github.com/Tezigudo/snapback-btc
-cd snapback-btc
+git clone https://github.com/Tezigudo/snapback
+cd snapback
 cp .env.example .env             # fill testnet keys
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
