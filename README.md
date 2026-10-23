@@ -16,7 +16,8 @@ Deterministic Binance Futures BTC/USDT perpetual bot. RSI(2) extreme + EMA(200) 
 ```bash
 git clone https://github.com/Tezigudo/snapback
 cd snapback
-cp .env.example .env             # fill testnet keys
+cp .env.example .env             # fill your keys
+sed -i.bak 's/^BINANCE_ENV=.*/BINANCE_ENV=testnet/' .env   # the template defaults to mainnet
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 python -c "from exchange.env import get_env; print(get_env())"   # -> 'testnet'
@@ -30,7 +31,11 @@ bot refuses to boot until each leg you run has a filled file. For each leg
 ```bash
 cp config/<name>.example.yaml config/<name>.yaml   # e.g. params_donchian
 $EDITOR config/<name>.yaml                          # replace EVERY null — meanings in config/README.md
-cp .env.example .env.<instance>                     # per-leg keys, if the leg uses a sub-account (use .env.<instance>.example where one exists)
+# Sub-account legs only: .env.<instance> overrides the base .env, so put ONLY that
+# leg's keys in it — never copy .env.example (it sets BINANCE_ENV=mainnet).
+cp .env.<instance>.example .env.<instance> 2>/dev/null \
+  || printf 'BINANCE_API_KEY=\nBINANCE_API_SECRET=\n' > .env.<instance>
+chmod 600 .env.<instance> && $EDITOR .env.<instance>
 python -m bot --instance <instance> --check-config  # must print CONFIG OK
 ```
 Do not start or enable any unit until `--check-config` prints `CONFIG OK` for that leg.

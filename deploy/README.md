@@ -5,26 +5,27 @@ Minimal Hetzner CCX13 (€4.50/mo) or DigitalOcean droplet ($6/mo). Static IP.
 ## One-time setup
 ```bash
 sudo useradd -r -s /usr/sbin/nologin -d /opt/snapback-btc snapback
-sudo mkdir -p /opt/snapback-btc /etc/snapback-btc /var/log/snapback-btc
+sudo mkdir -p /opt/snapback-btc /var/log/snapback-btc
 sudo chown -R snapback:snapback /opt/snapback-btc /var/log/snapback-btc
-sudo chown root:snapback /etc/snapback-btc && sudo chmod 750 /etc/snapback-btc
 
 git clone https://github.com/Tezigudo/snapback /opt/snapback-btc
 cd /opt/snapback-btc
 python3.11 -m venv .venv
 .venv/bin/pip install -e .
 
-sudo cp .env.example /etc/snapback-btc/.env
-sudo chmod 600 /etc/snapback-btc/.env
-sudo nano /etc/snapback-btc/.env   # fill mainnet keys, BINANCE_ENV=mainnet
+# The bot loads <repo>/.env itself (exchange/env.py); units set no EnvironmentFile.
+sudo -u snapback cp .env.example /opt/snapback-btc/.env
+sudo chmod 600 /opt/snapback-btc/.env
+sudo -u snapback nano /opt/snapback-btc/.env   # fill mainnet keys, BINANCE_ENV=mainnet
 
 sudo touch /opt/snapback-btc/confirm_mainnet.lock
 sudo chown snapback:snapback /opt/snapback-btc/confirm_mainnet.lock
 
 # Per-leg params: a clone has only config/*.example.yaml (all null). For each leg:
 #   cp config/<name>.example.yaml config/<name>.yaml && $EDITOR config/<name>.yaml
-#   (fill EVERY null — see config/README.md; per-leg keys go in .env.<instance>,
-#    copied from .env.example), then:
+#   (fill EVERY null — see config/README.md). Sub-account legs: .env.<instance>
+#   holds ONLY that leg's BINANCE_API_KEY/SECRET (from .env.<instance>.example
+#   where one exists — never a copy of .env.example; it overrides the base .env). Then:
 .venv/bin/python -m bot --instance v1 --check-config   # must print CONFIG OK
 # Do not enable/start a unit until its leg prints CONFIG OK.
 
@@ -46,7 +47,7 @@ sudo systemctl enable snapback-btc
 */5 * * * * /opt/snapback-btc/.venv/bin/python /opt/snapback-btc/monitor.py
 ```
 
-Email alerts: configure SMTP_* env vars in `/etc/snapback-btc/.env` (see
+Email alerts: configure SMTP_* env vars in `/opt/snapback-btc/.env` (the repo-root `.env`) (see
 `.env.example`).
 
 ⚠ DigitalOcean blocks ports 25/465/587 on droplets (since 2025-03-06), so
