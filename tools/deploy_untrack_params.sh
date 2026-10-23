@@ -18,8 +18,8 @@
 #
 # Environment overrides (defaults suit the droplet):
 #   REPO=/root/snapback-btc      repo working tree
-#   TARGET=origin/droplet        ref to fast-forward to
-#   BRANCH=droplet               branch that must be checked out
+#   TARGET=origin/master         ref to fast-forward to
+#   BRANCH=master                branch that must be checked out
 #   ASIDE_ROOT=/root             where the aside dir is created (outside REPO)
 #   PYTHON=$REPO/.venv/bin/python
 #   FETCH=1                      0 = skip `git fetch origin`
@@ -41,8 +41,8 @@ for a in "$@"; do
 done
 
 REPO="${REPO:-/root/snapback-btc}"
-TARGET="${TARGET:-origin/droplet}"
-BRANCH="${BRANCH:-droplet}"
+TARGET="${TARGET:-origin/master}"
+BRANCH="${BRANCH:-master}"
 ASIDE_ROOT="${ASIDE_ROOT:-/root}"
 PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
 FETCH="${FETCH:-1}"
