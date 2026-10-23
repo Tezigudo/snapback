@@ -4,22 +4,21 @@ Minimal Hetzner CCX13 (€4.50/mo) or DigitalOcean droplet ($6/mo). Static IP.
 
 ## One-time setup
 ```bash
-sudo useradd -r -s /usr/sbin/nologin -d /opt/snapback-btc snapback
-sudo mkdir -p /opt/snapback-btc /var/log/snapback-btc
-sudo chown -R snapback:snapback /opt/snapback-btc /var/log/snapback-btc
-
-git clone https://github.com/Tezigudo/snapback /opt/snapback-btc
-cd /opt/snapback-btc
+# The units in deploy/ run as root from /root/snapback-btc (User=root,
+# WorkingDirectory/ExecStart/ReadWritePaths). Clone exactly there, or edit
+# every path in the unit files before installing them.
+git clone https://github.com/Tezigudo/snapback /root/snapback-btc
+cd /root/snapback-btc
 python3.11 -m venv .venv
 .venv/bin/pip install -e .
+mkdir -p data logs reports              # the units' ReadWritePaths
 
 # The bot loads <repo>/.env itself (exchange/env.py); units set no EnvironmentFile.
-sudo -u snapback cp .env.example /opt/snapback-btc/.env
-sudo chmod 600 /opt/snapback-btc/.env
-sudo -u snapback nano /opt/snapback-btc/.env   # fill mainnet keys, BINANCE_ENV=mainnet
+cp .env.example /root/snapback-btc/.env
+chmod 600 /root/snapback-btc/.env
+nano /root/snapback-btc/.env             # fill mainnet keys, BINANCE_ENV=mainnet
 
-sudo touch /opt/snapback-btc/confirm_mainnet.lock
-sudo chown snapback:snapback /opt/snapback-btc/confirm_mainnet.lock
+touch /root/snapback-btc/confirm_mainnet.lock
 
 # Per-leg params: a clone has only config/*.example.yaml (all null). For each leg:
 #   cp config/<name>.example.yaml config/<name>.yaml && $EDITOR config/<name>.yaml
@@ -44,10 +43,10 @@ sudo systemctl enable snapback-btc
 
 ## Cron monitor (sends email alerts)
 ```cron
-*/5 * * * * /opt/snapback-btc/.venv/bin/python /opt/snapback-btc/monitor.py
+*/5 * * * * /root/snapback-btc/.venv/bin/python /root/snapback-btc/monitor.py
 ```
 
-Email alerts: configure SMTP_* env vars in `/opt/snapback-btc/.env` (the repo-root `.env`) (see
+Email alerts: configure SMTP_* env vars in `/root/snapback-btc/.env` (the repo-root `.env`) (see
 `.env.example`).
 
 ⚠ DigitalOcean blocks ports 25/465/587 on droplets (since 2025-03-06), so
