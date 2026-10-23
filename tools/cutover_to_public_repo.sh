@@ -12,7 +12,7 @@
 # Usage:
 #   cutover_to_public_repo.sh --private-sha <40hex> --public-sha <40hex> \
 #                             --excludes <file> [--apply]
-#   cutover_to_public_repo.sh --rollback <aside-dir>
+#   cutover_to_public_repo.sh --rollback <aside-dir> [--force-discard-master]
 #
 # Default is a DRY RUN. Its only write to the repo: a ref-less fetch
 # (`git ls-remote` for the tip, then `git fetch --no-write-fetch-head`) that
@@ -20,6 +20,14 @@
 # working-tree change. It fetches with the new deploy key, proves the
 # equivalence, and runs --check-config + the cron imports against an exported
 # copy of the new tree (in a temp dir that is deleted).
+#
+# Every mode also creates/locks .git/cutover.lock (exclusive flock for the
+# whole run; a second concurrent run refuses).
+#
+# --rollback trusts only an aside dir owned by the effective user, mode 0700,
+# with no group/other-writable entries or symlinks. It saves master's tip to
+# refs/cutover/master-<ts> and refuses if that tip is not the pinned public
+# sha unless --force-discard-master.
 #
 # --apply and --rollback refuse to run outside tmux/screen (an ssh drop would
 # otherwise SIGHUP the script mid-switch) unless --no-tmux-ok is passed.
@@ -31,7 +39,8 @@
 #   DEPLOY_KEY=<passwd home>/.ssh/gh_deploy_snapback
 #   SSH_ALIAS=github-snapback
 #   PYTHON=$REPO/.venv/bin/python
-#   ASIDE_ROOT=$HOME                  aside dir = $ASIDE_ROOT/cutover-aside-<ts>
+#   ASIDE_ROOT=<passwd home>          aside dir = $ASIDE_ROOT/cutover-aside-<ts>
+#   SSH_CONFIG_OVERRIDE=<file>        test hook: ssh config path (default <passwd home>/.ssh/config)
 #   SIM=1                             local simulation: skip ssh key/config,
 #                                     systemctl and crontab checks
 #   SYSTEMCTL_SHIM / CRONTAB_SHIM     test fakes (with SIM=1 they enable the
@@ -56,14 +65,14 @@ USER_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
 [[ -n "$USER_HOME" ]] || USER_HOME="$(eval echo "~$(id -un)")"   # macOS (sim): no getent
 DEPLOY_KEY="${DEPLOY_KEY:-$USER_HOME/.ssh/gh_deploy_snapback}"
 SSH_ALIAS="${SSH_ALIAS:-github-snapback}"
-SSH_CONFIG="$USER_HOME/.ssh/config"
+SSH_CONFIG="${SSH_CONFIG_OVERRIDE:-$USER_HOME/.ssh/config}"
 PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
 ASIDE_ROOT="$(cd "${ASIDE_ROOT:-$USER_HOME}" && pwd)"
 SIM="${SIM:-0}"
 SKIP_PY_CHECKS="${SKIP_PY_CHECKS:-0}"
 FAIL_AFTER="${CUTOVER_FAIL_AFTER:-}"
 
-APPLY=0; NO_TMUX_OK=0; ROLLBACK_DIR=""; PRIV_SHA=""; PUB_SHA=""; EXCLUDES=""
+APPLY=0; NO_TMUX_OK=0; FORCE_DISCARD_MASTER=0; ROLLBACK_DIR=""; PRIV_SHA=""; PUB_SHA=""; EXCLUDES=""
 ASIDE=""; APPLY_STARTED=0; DONE=0; FAILS=0
 
 # ------------------------------------------------------------------ helpers --
@@ -81,7 +90,7 @@ state_get() { sed -n "s/^$1=//p" "$2/state" | tail -1; }
 is_full_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 ssh_cmd() { printf 'ssh -F /dev/null -i %q -o IdentitiesOnly=yes -o BatchMode=yes' "$DEPLOY_KEY"; }
 
-usage() { sed -n '2,40p' "$0"; exit 2; }
+usage() { sed -n '2,50p' "$0"; exit 2; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -90,6 +99,7 @@ while [[ $# -gt 0 ]]; do
     --excludes)    EXCLUDES="$2"; shift 2 ;;
     --apply)       APPLY=1; shift ;;
     --no-tmux-ok)  NO_TMUX_OK=1; shift ;;
+    --force-discard-master) FORCE_DISCARD_MASTER=1; shift ;;
     --rollback)    ROLLBACK_DIR="$2"; shift 2 ;;
     -h|--help)     usage ;;
     *) die "unknown argument: $1" ;;
@@ -206,19 +216,31 @@ check_live_references() {   # $1 = NUL list of deleted paths
     info "SKIP crontab/unit reference check (SIM without SYSTEMCTL_SHIM)"; return 0; fi
   local SC="${SYSTEMCTL_SHIM:-systemctl}" CT="${CRONTAB_SHIM:-crontab}"
   local units u t blob p mod hits=0 frag real rel live tok nunits
-  units="$( { printf '%s\n' "${UNITS[@]}"
-              $SC list-units --all --no-legend --plain --type=service,timer 2>/dev/null | awk '{print $1}'
-              $SC list-unit-files --no-legend --type=service,timer 2>/dev/null | awk '{print $1}'
-            } | grep -E '^(snapback|run-)|sol' | LC_ALL=C sort -u)"
+  # Fail CLOSED: a scan over incomplete input would report a false OK.
+  local lu luf trig ctab cerr cat1
+  lu="$($SC list-units --all --no-legend --plain --type=service,timer)" || die "systemctl list-units failed — cannot verify live wiring"
+  luf="$($SC list-unit-files --no-legend --type=service,timer)" || die "systemctl list-unit-files failed — cannot verify live wiring"
+  units="$( { printf '%s\n' "${UNITS[@]}"; awk '{print $1}' <<<"$lu"; awk '{print $1}' <<<"$luf"; } \
+            | grep -E '^(snapback|run-)|sol' | LC_ALL=C sort -u || true)"
   for u in $units; do
     [[ "$u" == *.timer ]] || continue
-    for t in $($SC show -p Triggers --value "$u" 2>/dev/null); do units="$units"$'\n'"$t"; done
+    trig="$($SC show -p Triggers --value "$u")" || die "systemctl show Triggers $u failed"
+    for t in $trig; do units="$units"$'\n'"$t"; done
   done
   units="$(printf '%s\n' "$units" | LC_ALL=C sort -u)"
   nunits="$(printf '%s\n' "$units" | grep -c .)"
-  blob="$( { $CT -l 2>/dev/null || true
-             for u in $units; do $SC cat "$u" 2>/dev/null || true; done
-           } | grep -vE '^[[:space:]]*(#|;|$)' || true)"
+  cerr="$(mktemp)"
+  if ! ctab="$($CT -l 2>"$cerr")"; then
+    grep -qi 'no crontab for' "$cerr" || { cat "$cerr" >&2; rm -f "$cerr"; die "crontab -l failed — cannot verify live wiring"; }
+    ctab=""; info "note: no crontab for $(id -un)"
+  fi
+  rm -f "$cerr"
+  blob="$ctab"
+  for u in $units; do
+    cat1="$($SC cat "$u")" || die "systemctl cat $u failed — cannot verify live wiring"
+    blob="$blob"$'\n'"$cat1"
+  done
+  blob="$(grep -vE '^[[:space:]]*(#|;|$)' <<<"$blob" || true)"
   while IFS= read -r -d '' p; do
     if grep -qF -- "$p" <<<"$blob"; then fail "live wiring references deleted path: $p"; hits=$((hits+1)); continue; fi
     if [[ "$p" == *.py ]]; then
@@ -246,7 +268,7 @@ check_live_references() {   # $1 = NUL list of deleted paths
     fi
   done
   for u in $units; do
-    frag="$($SC show -p FragmentPath --value "$u" 2>/dev/null || true)"
+    frag="$($SC show -p FragmentPath --value "$u")" || die "systemctl show FragmentPath $u failed"
     [[ -n "$frag" && ( -e "$frag" || -L "$frag" ) ]] || continue
     real="$(readlink -f "$frag" 2>/dev/null || true)"
     [[ "$real" == "$REPO"/* ]] || continue
@@ -299,14 +321,72 @@ check_runtime_dirs() {
   info "OK  runtime dirs + all unit ReadWritePaths exist"
 }
 
+# ------------------------------------------------------------------ locking --
+# One cutover/rollback per repo at a time: exclusive, non-blocking lock on
+# $REPO/.git/cutover.lock held on fd 9 for the whole run (children inherit it).
+LOCKED_REPO=""
+acquire_lock() {   # $1 = repo
+  [[ "$LOCKED_REPO" == "$1" ]] && return 0
+  local lf="$1/.git/cutover.lock"
+  exec 9>>"$lf" || die "cannot open $lf"
+  if command -v flock >/dev/null 2>&1; then
+    flock -n 9 || die "another cutover/rollback holds $lf — refusing"
+  else   # macOS (sim): same flock(2) on the same open file description via perl
+    perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1' \
+      || die "another cutover/rollback holds $lf — refusing"
+  fi
+  LOCKED_REPO="$1"; info "OK  exclusive lock $lf"
+}
+
+# ------------------------------------------------------------ aside checks --
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+# Rollback trusts the aside dir (state, ssh_config.bak, tarball): refuse unless
+# it and everything in it is ours, nothing is group/other-writable, the dir is
+# 0700, and there are no symlinks.
+validate_aside() {   # $1 = aside dir
+  local a="$1" me bad
+  me="$(id -u)"
+  [[ -d "$a" && ! -L "$a" ]] || die "aside $a is not a real directory"
+  [[ "$(mode_of "$a")" == 700 ]] || die "aside $a mode is $(mode_of "$a"), not 700 — refusing"
+  bad="$(find "$a" ! -user "$me" -print -quit)"; [[ -z "$bad" ]] || die "aside entry not owned by uid $me: $bad"
+  bad="$(find "$a" \( -perm -020 -o -perm -002 \) -print -quit)"; [[ -z "$bad" ]] || die "aside entry group/other-writable: $bad"
+  bad="$(find "$a" -type l -print -quit)"; [[ -z "$bad" ]] || die "aside contains a symlink: $bad"
+  info "OK  aside $a: owned by uid $me, 0700, no g/o-writable entries, no symlinks"
+}
+# ssh config with the `Host $SSH_ALIAS` block (and blank lines preceding it) removed,
+# trailing blank lines trimmed — used to prove the backup differs ONLY by that block.
+strip_alias_block() {   # $1 = file (may be absent)
+  [[ -f "$1" ]] || return 0
+  awk -v alias="$SSH_ALIAS" '
+    function flush() { for (i = 0; i < nb; i++) print ""; nb = 0 }
+    /^[[:space:]]*$/ { if (!skip) nb++; next }
+    /^[[:space:]]*(Host|Match)[[:space:]]/ {
+      skip = ($1 == "Host" && NF == 2 && $2 == alias)
+      if (skip) { nb = 0; next }
+    }
+    skip { next }
+    { flush(); print }' "$1"
+}
+
 # ---------------------------------------------------------------- rollback --
 rollback() {   # $1 = aside dir; best effort, every step reported
-  local a="$1" rc=0
-  set +e
+  local a="$1" rc=0 pub_sha mtip ts
   step "ROLLBACK from $a"
-  REPO="$(state_get REPO "$a")"; PRIV_SHA="$(state_get PRIV_SHA "$a")"
-  local pub_added; pub_added="$(state_get PUBLIC_ADDED "$a")"
-  [[ -n "$REPO" && -d "$REPO/.git" ]] || { echo "[cutover] rollback: bad state file" >&2; return 1; }
+  validate_aside "$a"
+  REPO="$(state_get REPO "$a")"; PRIV_SHA="$(state_get PRIV_SHA "$a")"; pub_sha="$(state_get PUB_SHA "$a")"
+  [[ -n "$REPO" && -d "$REPO/.git" ]] && is_full_sha "$PRIV_SHA" && is_full_sha "$pub_sha" \
+    || die "rollback: bad state file"
+  acquire_lock "$REPO"
+  # Never silently lose work on master: always keep its tip under refs/cutover/,
+  # and refuse if it moved past the pinned public sha unless explicitly forced.
+  if g show-ref -q --verify refs/heads/master; then
+    mtip="$(g rev-parse refs/heads/master)"; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    run g update-ref "refs/cutover/master-$ts" "$mtip"
+    if [[ "$mtip" != "$pub_sha" && $FORCE_DISCARD_MASTER -ne 1 ]]; then
+      die "master tip ${mtip:0:7} != pinned ${pub_sha:0:7} (local commits?) — saved as refs/cutover/master-$ts; re-run with --force-discard-master to proceed"
+    fi
+  fi
+  set +e
 
   if [[ -e "$REPO/.git/index.lock" ]]; then
     if pgrep -x git >/dev/null 2>&1; then
@@ -318,7 +398,7 @@ rollback() {   # $1 = aside dir; best effort, every step reported
   fi
   [[ "$(g rev-parse HEAD)" == "$PRIV_SHA" ]] || { echo "[cutover] rollback: droplet HEAD != $PRIV_SHA" >&2; rc=1; }
   if g show-ref -q --verify refs/heads/master && [[ "$(state_get MASTER_CREATED "$a")" == 1 ]]; then
-    run g branch -q -D master
+    run g branch -q -D master   # tip already saved under refs/cutover/
   fi
   # restore any deleted tracked file that is still missing (checkout normally does it)
   local missing; missing="$(g ls-files -d)"
@@ -337,14 +417,20 @@ rollback() {   # $1 = aside dir; best effort, every step reported
   else
     info "remotes already restored (no 'private' remote)"
   fi
-  if [[ "$pub_added" == 1 && "$(g remote get-url public 2>/dev/null)" == "$pub_url" ]]; then
+  # remove 'public' only if the journal says it did not pre-exist and this run meant to add it
+  if [[ "$(state_get PUBLIC_PREEXISTED "$a")" == 0 && "$(state_get PUBLIC_ADD_INTENT "$a")" == 1 \
+        && "$(g remote get-url public 2>/dev/null)" == "$pub_url" ]]; then
     run g remote remove public
   fi
   [[ "$(g config branch.droplet.remote)" == origin ]] || { echo "[cutover] rollback: droplet upstream remote is not origin" >&2; rc=1; }
 
   if [[ "$(state_get SSH_MODIFIED "$a")" == 1 ]]; then
-    if [[ -f "$a/ssh_config.bak" ]]; then run cp -p "$a/ssh_config.bak" "$SSH_CONFIG"
-    else run rm -f "$SSH_CONFIG"; fi   # there was no config before
+    # restore only if backup == current config minus the Host $SSH_ALIAS block
+    if [[ "$(strip_alias_block "$a/ssh_config.bak")" != "$(strip_alias_block "$SSH_CONFIG")" ]]; then
+      echo "[cutover] rollback: $a/ssh_config.bak differs from $SSH_CONFIG by more than the 'Host $SSH_ALIAS' block — NOT restoring; fix by hand" >&2; rc=1
+    elif [[ -f "$a/ssh_config.bak" ]]; then run cp "$a/ssh_config.bak" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+    elif [[ -z "$(strip_alias_block "$SSH_CONFIG")" ]]; then run rm -f "$SSH_CONFIG"   # there was no config before
+    fi
   fi
 
   ASIDE="$a"; ASIDE_TMP="$a/tmp"; mkdir -p "$ASIDE_TMP"
@@ -403,6 +489,7 @@ step "$([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)  repo=$REPO  private=$
 
 step "1. preflight"
 [[ -d "$REPO/.git" ]] || die "$REPO is not a git checkout"
+acquire_lock "$REPO"
 [[ -e "$REPO/.git/index.lock" ]] && die ".git/index.lock exists — another git process running (or crashed); investigate first"
 [[ "$(g symbolic-ref -q --short HEAD)" == droplet ]] || die "branch is not 'droplet'"
 [[ "$(g rev-parse HEAD)" == "$PRIV_SHA" ]] || die "HEAD $(g rev-parse --short HEAD) != expected ${PRIV_SHA:0:7}"
@@ -446,6 +533,13 @@ info "OK  public/master tip ${TIP:0:7}; pinned ${PUB_SHA:0:7} is on it$([[ $TIP 
 
 step "3. prove equivalence"
 prove_equivalence "$ASIDE_TMP/deleted.z"
+# live state must never be in the deletion set (a tracked live file would vanish on checkout)
+# (*.example templates are not live state — the public tree drops the cnh ones)
+live_hits="$(tr '\0' '\n' < "$ASIDE_TMP/deleted.z" | grep -E '(^|/)\.env[^/]*$|^config/params[^/]*\.yaml$|\.db$|^data/|^logs/' \
+             | grep -vE '\.example(\.yaml)?$' || true)"
+[[ -z "$live_hits" ]] || die "deletion set contains live-state paths (.env*/config/params*.yaml/*.db/data/logs) — refusing:
+$live_hits"
+info "OK  no .env*, config/params*.yaml, *.db, data/ or logs/ path in the deletion set"
 check_live_references "$ASIDE_TMP/deleted.z"
 
 step "3b. python checks against an export of the NEW tree (live params/env symlinked in)"
@@ -484,6 +578,7 @@ mkdir -m 700 "$ASIDE"; mkdir -m 700 "$ASIDE/tmp"
 mv "$ASIDE_TMP/deleted.z" "$ASIDE/deleted.z"; mv "$ASIDE_TMP/services.before" "$ASIDE/services.before"
 rm -rf "$ASIDE_TMP"; EXPORT_DIR=""; ASIDE_TMP="$ASIDE/tmp"
 state_set REPO "$REPO"; state_set PRIV_SHA "$PRIV_SHA"; state_set PUB_SHA "$PUB_SHA"; state_set PUBLIC_URL "$PUBLIC_URL"
+state_set PUBLIC_PREEXISTED "$PUBLIC_PREEXISTS"   # journaled before any mutation
 build_manifest "$ASIDE/before"
 info "manifest: $(wc -l < "$ASIDE/before.strict" | tr -d ' ') secrets/params hashed, $(wc -l < "$ASIDE/before.inode" | tr -d ' ') runtime files, $(wc -l < "$ASIDE/before.untracked" | tr -d ' ') untracked"
 (cd "$REPO" && tar --null -T "$ASIDE/deleted.z" -czf "$ASIDE/deleted-tracked.tgz")
@@ -510,7 +605,7 @@ fi
 maybe_fail ssh
 
 step "5b. add + fetch remote 'public'"
-if [[ $PUBLIC_PREEXISTS -eq 0 ]]; then run g remote add public "$PUBLIC_URL"; state_set PUBLIC_ADDED 1; fi
+if [[ $PUBLIC_PREEXISTS -eq 0 ]]; then state_set PUBLIC_ADD_INTENT 1; run g remote add public "$PUBLIC_URL"; fi
 run env GIT_SSH_COMMAND="ssh -o BatchMode=yes" git -C "$REPO" fetch -q --no-tags --no-write-fetch-head public master
 g merge-base --is-ancestor "$PUB_SHA" refs/remotes/public/master || die "pinned sha not on public/master via the alias remote"
 info "OK  fetched via $PUBLIC_URL"
@@ -541,6 +636,13 @@ left=0; while IFS= read -r -d '' p; do [[ -e "$REPO/$p" ]] && left=$((left+1)); 
 build_manifest "$ASIDE/after"
 compare_manifests "$ASIDE/before" "$ASIDE/after"
 check_runtime_dirs
+for f in .env config/params.yaml config/params_donchian.yaml config/params_sol_supertrend.yaml; do
+  [[ -f "$REPO/$f" ]] || fail "live file missing after switch: $f"
+done
+for d in data logs; do [[ -d "$REPO/$d" ]] || fail "live dir missing after switch: $d/"; done
+dbs="$(cut -f2 "$ASIDE/before.inode")"
+[[ -n "$dbs" ]] && while IFS= read -r f; do [[ -f "$REPO/$f" ]] || fail "DB missing after switch: $f"; done <<<"$dbs"
+info "OK  .env, the 3 live params files, data/, logs/ and all $(grep -c . <<<"$dbs" || true) DBs exist"
 py_checks "$REPO"
 services_snapshot "$ASIDE/services.after"
 if cmp -s "$ASIDE/services.before" "$ASIDE/services.after"; then
@@ -555,6 +657,5 @@ info "aside (keep until confident): $ASIDE   rollback: $0 --rollback $ASIDE"
 info "No service restart needed: running bots keep their loaded code; the next restart loads identical files."
 info "Future deploys:  cd $REPO && git fetch origin && git merge --ff-only origin/master"
 info "Then restart legs ONLY via tools/leg_safe_restart.py <instance>."
-info "tools/deploy_untrack_params.sh defaults to origin/droplet + branch droplet on ${PUB_SHA:0:7};"
-info "  pass TARGET=origin/master BRANCH=master until the fix commit is merged."
+info "tools/deploy_untrack_params.sh (as shipped with this script) defaults to TARGET=origin/master, BRANCH=master."
 info "Old remote kept as 'private' (old deploy key). Remove later: git remote remove private"
