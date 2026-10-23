@@ -1,0 +1,59 @@
+# TEST FIXTURE — synthetic values, NOT the live params. Same key
+# structure as config/params_donchian.example.yaml. Tests assert relative
+# to these values; never copy live numbers in here.
+symbol: BTC/USDT:USDT
+strategy_name: donchian-v3
+timeframes:
+  entry: 4h
+  trend: 4h
+strategy:
+  donchian_period_entry: 55
+  donchian_period_exit: 7
+  regime_ema_period: 99
+  regime_slope_window: 21
+  slope_trend_threshold_pct: 0.07
+  atr_period: 13
+  atr_sl_multiple: 1.25
+  atr_trail_multiple: 0.0
+  time_stop_bars: 77
+  max_hold_bars: 77
+  rsi_period: 11
+  rsi_long_threshold: 31
+  rsi_short_threshold: 69
+  ema_period: 150
+  mf_trend_ema_period: 150
+  volume_ma_period: 17
+  volume_multiple: 1.25
+  funding_extreme_threshold: 0.0011
+  require_funding_not_extreme: true
+  funding_long_max: -0.0002
+  funding_short_min: 0.0002
+  sl_pct: 0.011
+  tp_pct: 0.023
+  require_trend: true
+  require_candlestick: false
+  require_macd: false
+sizing:
+  risk_per_trade_pct: 1.25
+  leverage: 7
+execution:
+  order_type: limit
+  limit_offset_bps: 0.0
+  limit_timeout_s: 25.0
+  poll_interval_s: 60
+  reconcile_on_boot: true
+hedge:
+  enabled: false
+  client_order_id_prefix: snap-d3-
+deploy:
+  kill_switch_equity_fraction: 0.55
+  daily_status_email_hour_utc: 0
+  min_capital_warn_usdt: 12.0
+risk:  # synthetic, NOT the live ceilings
+  max_notional_usd: 750.0
+  max_leverage: 10
+  max_daily_loss_pct: 2.75
+  max_open_positions: 1
+  max_orders_per_minute: 9
+  max_consecutive_losses: 5
+  min_time_between_trades_s: 45

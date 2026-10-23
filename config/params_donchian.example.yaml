@@ -1,0 +1,66 @@
+# params_donchian.example.yaml — TEMPLATE for config/params_donchian.yaml (that file is gitignored).
+#
+#   cp config/params_donchian.example.yaml config/params_donchian.yaml   # then fill in EVERY null
+#
+# EVERY value is deliberately null (fail-closed: an unfilled copy refuses to
+# boot), except strategy_name, which selects the key schema. The bot refuses to
+# boot while any key it reads is missing or null (config_check.REQUIRED_KEYS;
+# test with: python -m bot --instance donchian --check-config). There are no code
+# defaults to fall back on. Booleans must be true/false; see config/README.md.
+
+symbol: null
+strategy_name: donchian-v3
+timeframes:
+  entry: null
+  trend: null
+strategy:
+  donchian_period_entry: null
+  donchian_period_exit: null
+  regime_ema_period: null
+  regime_slope_window: null
+  slope_trend_threshold_pct: null
+  atr_period: null
+  atr_sl_multiple: null
+  atr_trail_multiple: null
+  time_stop_bars: null
+  max_hold_bars: null
+  rsi_period: null
+  rsi_long_threshold: null
+  rsi_short_threshold: null
+  ema_period: null
+  mf_trend_ema_period: null
+  volume_ma_period: null
+  volume_multiple: null
+  funding_extreme_threshold: null
+  require_funding_not_extreme: null
+  funding_long_max: null
+  funding_short_min: null
+  sl_pct: null
+  tp_pct: null
+  require_trend: null
+  require_candlestick: null
+  require_macd: null
+sizing:
+  risk_per_trade_pct: null
+  leverage: null
+execution:
+  order_type: null
+  limit_offset_bps: null
+  limit_timeout_s: null
+  poll_interval_s: null
+  reconcile_on_boot: null
+hedge:
+  enabled: null
+  client_order_id_prefix: null
+deploy:
+  kill_switch_equity_fraction: null
+  daily_status_email_hour_utc: null
+  min_capital_warn_usdt: null
+risk:  # risk.py hard ceilings (RISK_REVIEW); see risk.RiskCeilings for what each enforces
+  max_notional_usd: null
+  max_leverage: null
+  max_daily_loss_pct: null
+  max_open_positions: null
+  max_orders_per_minute: null
+  max_consecutive_losses: null
+  min_time_between_trades_s: null

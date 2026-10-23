@@ -1,0 +1,47 @@
+[Unit]
+Description=snapback sol-supertrend leg (SOL/USDT perp, 4h Supertrend, long+short)
+After=network-online.target snapback-btc.service snapback-btc-donchian.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/snapback-btc
+# `--instance sol_supertrend` makes the bot load /root/snapback-btc/.env.sol_supertrend
+# (override=True) on top of the base .env. That file MUST hold this leg's own
+# sub-account BINANCE_API_KEY / BINANCE_API_SECRET (reuse the cnh_short
+# sub-account — that leg was never funded), and ALSO:
+#   CONSOLIDATE_SOURCE=snapback-sol-supertrend   (else events collide with v1 on the dashboard)
+#   ALERT_TAG=snapback-sol-st                    (else email subjects don't distinguish legs)
+# The bot loads this file itself, so no systemd EnvironmentFile is used.
+#
+# PRECONDITIONS — this unit will crash-loop at boot until all are true:
+#   1. risk.py ALLOWED_SYMBOLS includes "SOL/USDT:USDT" (check_symbol runs at
+#      startup and blocks even --dry-run). Tier-3 edit, needs RISK_REVIEW=1.
+#      See deploy/RISK_REVIEW_sol_symbol.patch.
+#   2. .env.sol_supertrend exists with the sub-account key.
+#   3. Sub-account funded (too little and signals get skipped on min-notional;
+#      above the params risk.max_notional_usd ceiling, risk.check_notional
+#      skips oversize signals).
+#
+# Run --dry-run for at least one full Supertrend flip cycle before going live.
+ExecStart=/root/snapback-btc/.venv/bin/python -m bot --instance sol_supertrend
+# on-failure, NOT always: clean /halt and kill-switch flatten exit 0 and must stay down.
+Restart=on-failure
+RestartSec=10
+# 78 = EX_CONFIG: params YAML missing/incomplete (config_check.py). Do not
+# crash-loop and re-alert every RestartSec - fix the file, then start.
+RestartPreventExitStatus=78
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snapback-sol-st
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/root/snapback-btc/data /root/snapback-btc/logs /root/snapback-btc/reports
+# ProtectHome intentionally unset (deploy lives under /root).
+
+[Install]
+WantedBy=multi-user.target

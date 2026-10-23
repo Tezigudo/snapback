@@ -1,0 +1,5 @@
+# Copy to .guard_patterns (gitignored). One extended regex per line.
+# Droplet public IPv4 (escape dots):
+<DROPLET_IP_REGEX_EG_1\.2\.3\.4>
+# Owner / alert email local part:
+<EMAIL_LOCALPART>

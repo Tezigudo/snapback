@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# 1) Reject staged secrets (tools/guard_secrets.sh; patterns in untracked .guard_patterns).
+# 2) Reject commits that touch risk.py unless RISK_REVIEW=1 is set.
+# This is the last line of defence against silently weakening hard ceilings.
+#
+# Enable hooks in a fresh clone:
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+"$(git rev-parse --show-toplevel)/tools/guard_secrets.sh"
+
+if git diff --cached --name-only | grep -qE '^risk\.py$'; then
+    if [[ "${RISK_REVIEW:-0}" != "1" ]]; then
+        echo "✗ risk.py is staged. Hard ceilings cannot be edited casually." >&2
+        echo "  If you really mean it, run with RISK_REVIEW=1:" >&2
+        echo "    RISK_REVIEW=1 git commit -m '...'" >&2
+        echo "  And include a written justification in the commit body." >&2
+        exit 1
+    fi
+    echo "⚠ risk.py edit allowed via RISK_REVIEW=1. Make sure the commit body explains why." >&2
+fi

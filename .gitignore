@@ -1,0 +1,78 @@
+# secrets + env
+.env
+.env.local
+.env.*.local
+# Per-leg secrets. Each multi-leg instance keeps its own sub-account
+# BINANCE_API_KEY/SECRET in `.env.<instance>` (.env.donchian, .env.cnh_short,
+# .env.sol_supertrend, ...). Those were NOT matched by the three patterns above,
+# so a `git add -A` would have committed a live API key. Ignore the whole family
+# and re-admit only the non-secret templates.
+.env.*
+!.env.example
+!.env.*.example
+
+# mainnet gate — must be created manually, never committed
+confirm_mainnet.lock
+
+# runtime state — never commit
+data/state.db
+data/state.db-journal
+data/state.db-wal
+data/state.db-shm
+data/heartbeat
+data/HALT
+data/historical/
+
+# logs + generated reports
+logs/*.jsonl
+logs/*.log
+reports/*.html
+reports/**/*.log
+
+# python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# uv
+uv.lock
+
+# capitulation alert runtime state
+data/capitulation_alerts.json
+logs/capitulation_watch.log
+
+# research data dumps + experiment outputs (regenerable, large — never commit)
+data/pumpfade/
+data/*_results.json
+data/*_result.json
+reports/*.csv
+
+# local secret-guard patterns (IP/email regexes) - never commit
+.guard_patterns
+
+# Live per-leg strategy params — NEVER commit (repo is headed public).
+# Only the null-valued templates are tracked; see config/README.md.
+config/params*.yaml
+!config/params*.example.yaml
+# tools/migrate_risk_params.py backups — they hold the live risk ceilings.
+config/*.bak
+config/.*.migrate.tmp
