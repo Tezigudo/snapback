@@ -29,6 +29,8 @@
 #   ASIDE_ROOT=$HOME                  aside dir = $ASIDE_ROOT/cutover-aside-<ts>
 #   SIM=1                             local simulation: skip ssh key/config,
 #                                     systemctl and crontab checks
+#   SYSTEMCTL_SHIM / CRONTAB_SHIM     test fakes (with SIM=1 they enable the
+#                                     crontab/unit reference check)
 #   SKIP_PY_CHECKS=1                  skip --check-config/cron imports (reported)
 #   CUTOVER_FAIL_AFTER=<phase>        test hook: fail after ssh|remote|rename|switch|verify
 set -euo pipefail
@@ -71,7 +73,7 @@ state_get() { sed -n "s/^$1=//p" "$2/state" | tail -1; }
 is_full_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 ssh_cmd() { printf 'ssh -F /dev/null -i %q -o IdentitiesOnly=yes -o BatchMode=yes' "$DEPLOY_KEY"; }
 
-usage() { sed -n '2,33p' "$0"; exit 2; }
+usage() { sed -n '2,35p' "$0"; exit 2; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -174,23 +176,72 @@ prove_equivalence() {
   info "OK  public = private HEAD minus $n deleted paths, all covered by ${#ex[@]} exclude entries; 0 M/A/R/T"
 }
 
-# Live wiring must not reference a path that is about to disappear.
+# Live wiring = root crontab + every snapback/sol/run-* unit and timer (and the
+# services timers trigger) + where unit files really live. Non-comment lines
+# only. Two checks:
+#  (a) no deleted path appears, as a path or (for .py) as a dotted module name;
+#  (b) every `-m <module>` and every $REPO/<path> that exists at private HEAD
+#      still exists in the public tree.
+# A unit FILE that is a symlink into a deleted path: fatal for the live legs,
+# WARN for anything else (e.g. the disabled cnh unit).
 check_live_references() {   # $1 = NUL list of deleted paths
-  if [[ "$SIM" == 1 ]]; then info "SKIP crontab/unit reference check (SIM)"; return; fi
-  local blob p u hits=0
-  blob="$( { crontab -l 2>/dev/null || true
-             for u in "${UNITS[@]}"; do systemctl cat "$u" 2>/dev/null || true; done
-             for u in /etc/systemd/system/snapback*.service /etc/systemd/system/*/snapback*; do
-               [[ -e "$u" || -L "$u" ]] && readlink -f "$u"; done; } )"
-  while IFS= read -r -d '' p; do
-    if grep -qF -- "$p" <<<"$blob"; then fail "live crontab/unit references deleted path: $p"; hits=$((hits+1)); fi
-  done < "$1"
-  [[ $hits -eq 0 ]] && info "OK  crontab + units + unit symlinks reference none of the deleted paths" \
-    || die "live wiring references deleted paths"
-  for u in /etc/systemd/system/snapback*.service; do
-    [[ -L "$u" && ! -e "$u" ]] && info "WARN dangling unit symlink (pre-existing): $u"
+  if [[ "$SIM" == 1 && -z "${SYSTEMCTL_SHIM:-}" ]]; then
+    info "SKIP crontab/unit reference check (SIM without SYSTEMCTL_SHIM)"; return 0; fi
+  local SC="${SYSTEMCTL_SHIM:-systemctl}" CT="${CRONTAB_SHIM:-crontab}"
+  local units u t blob p mod hits=0 frag real rel live tok nunits
+  units="$( { printf '%s\n' "${UNITS[@]}"
+              $SC list-units --all --no-legend --plain --type=service,timer 2>/dev/null | awk '{print $1}'
+              $SC list-unit-files --no-legend --type=service,timer 2>/dev/null | awk '{print $1}'
+            } | grep -E '^(snapback|run-)|sol' | LC_ALL=C sort -u)"
+  for u in $units; do
+    [[ "$u" == *.timer ]] || continue
+    for t in $($SC show -p Triggers --value "$u" 2>/dev/null); do units="$units"$'\n'"$t"; done
   done
-  return 0
+  units="$(printf '%s\n' "$units" | LC_ALL=C sort -u)"
+  nunits="$(printf '%s\n' "$units" | grep -c .)"
+  blob="$( { $CT -l 2>/dev/null || true
+             for u in $units; do $SC cat "$u" 2>/dev/null || true; done
+           } | grep -vE '^[[:space:]]*(#|;|$)' || true)"
+  while IFS= read -r -d '' p; do
+    if grep -qF -- "$p" <<<"$blob"; then fail "live wiring references deleted path: $p"; hits=$((hits+1)); continue; fi
+    if [[ "$p" == *.py ]]; then
+      mod="${p%.py}"; mod="${mod%/__init__}"; mod="${mod//\//.}"
+      if grep -qwF -- "$mod" <<<"$blob"; then fail "live wiring references deleted module: $mod"; hits=$((hits+1)); fi
+    fi
+  done < "$1"
+  for tok in $(grep -oE -- '-m [A-Za-z_][A-Za-z0-9_.]*' <<<"$blob" | awk '{print $2}' | LC_ALL=C sort -u); do
+    rel="${tok//.//}"
+    for t in "$rel.py" "$rel/__init__.py" "$rel/__main__.py"; do
+      if g cat-file -e "$PRIV_SHA:$t" 2>/dev/null; then
+        g cat-file -e "$PUB_SHA:$t" 2>/dev/null || { fail "live wiring runs -m $tok, absent in public tree"; hits=$((hits+1)); }
+        break
+      fi
+    done
+  done
+  for tok in $(grep -oE -- "$REPO/[A-Za-z0-9_./-]+" <<<"$blob" | LC_ALL=C sort -u); do
+    rel="${tok#"$REPO"/}"; rel="${rel%/}"
+    if [[ " ${RUNTIME_DIRS[*]} " == *" $rel "* ]]; then
+      g cat-file -e "$PUB_SHA:$rel" 2>/dev/null || info "note: unit/cron dir $rel/ is not tracked in public tree — step 5d keeps it (mkdir -p)"
+      continue
+    fi
+    if g cat-file -e "$PRIV_SHA:$rel" 2>/dev/null && ! g cat-file -e "$PUB_SHA:$rel" 2>/dev/null; then
+      fail "live wiring uses $rel, absent in public tree"; hits=$((hits+1))
+    fi
+  done
+  for u in $units; do
+    frag="$($SC show -p FragmentPath --value "$u" 2>/dev/null || true)"
+    [[ -n "$frag" && ( -e "$frag" || -L "$frag" ) ]] || continue
+    real="$(readlink -f "$frag" 2>/dev/null || true)"
+    [[ "$real" == "$REPO"/* ]] || continue
+    rel="${real#"$REPO"/}"
+    if tr '\0' '\n' < "$1" | grep -qxF -- "$rel"; then
+      live=0; for t in "${UNITS[@]}"; do [[ "$u" == "$t" || "$u" == "$t.service" ]] && live=1; done
+      if [[ $live -eq 1 ]]; then fail "live unit $u is a symlink to deleted $rel"; hits=$((hits+1))
+      else info "WARN unit $u is a symlink to deleted $rel — it will dangle; if unused: systemctl disable $u && rm -f $frag && systemctl daemon-reload"; fi
+    fi
+  done
+  [[ $hits -eq 0 ]] || die "live wiring references $hits removed path(s)/module(s)"
+  info "OK  crontab + $nunits units/timers: no reference to removed paths/modules; every -m/$REPO path exists in public tree"
 }
 
 # --check-config for every live leg + import of every cron module, run in $1.
@@ -214,8 +265,8 @@ services_snapshot() {   # $1 = output file ("unit active pid")
   [[ "$SIM" == 1 ]] && return 0
   local u
   for u in "${UNITS[@]}"; do
-    printf '%s %s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)" \
-      "$(systemctl show -p MainPID --value "$u" 2>/dev/null || echo ?)" >> "$1"
+    printf '%s %s %s\n' "$u" "$(${SYSTEMCTL_SHIM:-systemctl} is-active "$u" 2>/dev/null || true)" \
+      "$(${SYSTEMCTL_SHIM:-systemctl} show -p MainPID --value "$u" 2>/dev/null || echo ?)" >> "$1"
   done
 }
 
@@ -224,7 +275,7 @@ check_runtime_dirs() {
   for d in "${RUNTIME_DIRS[@]}"; do [[ -d "$REPO/$d" ]] || fail "runtime dir missing: $REPO/$d"; done
   [[ "$SIM" == 1 ]] && { info "OK  runtime dirs present: ${RUNTIME_DIRS[*]} (unit ReadWritePaths scan skipped, SIM)"; return; }
   for u in "${UNITS[@]}"; do
-    for p in $(systemctl show -p ReadWritePaths --value "$u" 2>/dev/null); do
+    for p in $(${SYSTEMCTL_SHIM:-systemctl} show -p ReadWritePaths --value "$u" 2>/dev/null); do
       p="${p#-}"; [[ -d "$p" ]] || fail "$u ReadWritePaths dir missing: $p (unit would fail on next restart)"
     done
   done
