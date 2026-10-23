@@ -29,6 +29,14 @@
 # refs/cutover/master-<ts> and refuses if that tip is not the pinned public
 # sha unless --force-discard-master.
 #
+# If a run is KILLED mid-switch (SIGKILL / power loss — no trap runs): do not
+# restart units; run `--rollback <aside>` (path printed before step 5a). It
+# clears stale .git locks, does `git checkout -f droplet` (tracked edits saved
+# to the aside first), restores remotes/ssh config, and re-verifies. Confirm
+# ROLLBACK COMPLETE + a clean `git status`. Units are never stopped by this
+# script; only if a leg misbehaved: stop the 3 bot units, roll back, verify,
+# start each via tools/leg_safe_restart.py.
+#
 # --apply and --rollback refuse to run outside tmux/screen (an ssh drop would
 # otherwise SIGHUP the script mid-switch) unless --no-tmux-ok is passed.
 #
@@ -47,6 +55,7 @@
 #                                     crontab/unit reference check)
 #   SKIP_PY_CHECKS=1                  skip --check-config/cron imports (reported)
 #   CUTOVER_FAIL_AFTER=<phase>        test hook: fail after ssh|remote|rename|switch|verify
+#   CUTOVER_KILL_AFTER=<phase>        test hook: SIGKILL itself after that phase (no trap)
 set -euo pipefail
 umask 077
 
@@ -83,14 +92,16 @@ fail() { printf '[cutover] CHECK FAILED: %s\n' "$*" >&2; FAILS=$((FAILS+1)); }
 run()  { printf '[cutover] + %s\n' "$*"; "$@"; }
 sha()  { sha256sum "$@"; }
 inode() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
-maybe_fail() { [[ "$FAIL_AFTER" == "$1" ]] && die "injected failure after phase '$1'"; return 0; }
+maybe_fail() {
+  [[ "${CUTOVER_KILL_AFTER:-}" == "$1" ]] && kill -9 $$   # test hook: no trap runs, like power loss
+  [[ "$FAIL_AFTER" == "$1" ]] && die "injected failure after phase '$1'"; return 0; }
 g() { git -C "$REPO" "$@"; }
 state_set() { printf '%s=%s\n' "$1" "$2" >> "$ASIDE/state"; }
 state_get() { sed -n "s/^$1=//p" "$2/state" | tail -1; }
 is_full_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 ssh_cmd() { printf 'ssh -F /dev/null -i %q -o IdentitiesOnly=yes -o BatchMode=yes' "$DEPLOY_KEY"; }
 
-usage() { sed -n '2,50p' "$0"; exit 2; }
+usage() { sed -n '2,58p' "$0"; exit 2; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -368,6 +379,20 @@ strip_alias_block() {   # $1 = file (may be absent)
     { flush(); print }' "$1"
 }
 
+recovery_help() {   # $1 = aside dir
+  cat >&2 <<EOH
+[cutover] ---- IF THIS RUN IS KILLED (SIGKILL / power loss / ssh drop outside tmux) ----
+[cutover]  1. Do not restart any unit yet (a restart re-runs boot()).
+[cutover]  2. $0 --rollback $1
+[cutover]     (clears stale git locks, forces the tree back to droplet, restores remotes)
+[cutover]  3. Verify it printed ROLLBACK COMPLETE, and: git -C $REPO status --short --untracked-files=no  -> empty
+[cutover]  4. Units were never stopped by this script, so normally nothing more is needed.
+[cutover]     If any leg died or misbehaved meanwhile: stop snapback-btc, snapback-btc-donchian,
+[cutover]     snapback-sol-supertrend; re-run step 2-3; start each leg via tools/leg_safe_restart.py <instance>.
+[cutover] -------------------------------------------------------------------------------
+EOH
+}
+
 # ---------------------------------------------------------------- rollback --
 rollback() {   # $1 = aside dir; best effort, every step reported
   local a="$1" rc=0 pub_sha mtip ts
@@ -388,14 +413,22 @@ rollback() {   # $1 = aside dir; best effort, every step reported
   fi
   set +e
 
-  if [[ -e "$REPO/.git/index.lock" ]]; then
+  # A run killed mid-switch (SIGKILL / power loss) can leave stale git locks
+  # and a half-switched working tree; clear stale locks, then FORCE the tree
+  # back to droplet (any tracked edits are saved to the aside first).
+  local lk
+  for lk in index.lock config.lock HEAD.lock; do
+    [[ -e "$REPO/.git/$lk" ]] || continue
     if pgrep -x git >/dev/null 2>&1; then
-      echo "[cutover] rollback: .git/index.lock present AND a git process is running — not touching it" >&2; rc=1
-    else run rm -f "$REPO/.git/index.lock"; fi
+      die "rollback: .git/$lk present AND a git process is running — wait for it, then re-run --rollback"
+    fi
+    run rm -f "$REPO/.git/$lk"
+  done
+  if [[ -n "$(g status --porcelain --untracked-files=no)" ]]; then
+    g diff --binary HEAD > "$a/pre-rollback-tracked.patch" 2>/dev/null
+    info "tracked changes present (partial switch?) — saved as $a/pre-rollback-tracked.patch"
   fi
-  if [[ "$(g symbolic-ref -q --short HEAD)" != droplet ]]; then
-    run g checkout -q droplet || { echo "[cutover] rollback: checkout droplet FAILED — fix by hand" >&2; rc=1; }
-  fi
+  run g checkout -q -f droplet || { echo "[cutover] rollback: checkout -f droplet FAILED — fix by hand" >&2; rc=1; }
   [[ "$(g rev-parse HEAD)" == "$PRIV_SHA" ]] || { echo "[cutover] rollback: droplet HEAD != $PRIV_SHA" >&2; rc=1; }
   if g show-ref -q --verify refs/heads/master && [[ "$(state_get MASTER_CREATED "$a")" == 1 ]]; then
     run g branch -q -D master   # tip already saved under refs/cutover/
@@ -450,7 +483,7 @@ on_exit() {
   if [[ $APPLY_STARTED -eq 1 && $DONE -ne 1 ]]; then
     echo "[cutover] apply did not complete (rc=$rc) — rolling back automatically" >&2
     APPLY_STARTED=0
-    rollback "$ASIDE" || true
+    rollback "$ASIDE" || { echo "[cutover] AUTOMATIC ROLLBACK FAILED" >&2; recovery_help "$ASIDE"; }
     exit $(( rc == 0 ? 1 : rc ))
   fi
   [[ -n "${EXPORT_DIR:-}" && -d "${EXPORT_DIR:-}" ]] && rm -rf "$EXPORT_DIR"
@@ -584,6 +617,7 @@ info "manifest: $(wc -l < "$ASIDE/before.strict" | tr -d ' ') secrets/params has
 (cd "$REPO" && tar --null -T "$ASIDE/deleted.z" -czf "$ASIDE/deleted-tracked.tgz")
 info "tarred $(tr -cd '\0' < "$ASIDE/deleted.z" | wc -c | tr -d ' ') to-be-deleted tracked files -> $ASIDE/deleted-tracked.tgz"
 APPLY_STARTED=1   # from here on any exit without DONE=1 rolls back
+recovery_help "$ASIDE"
 
 step "5a. ssh alias"
 if [[ "$SIM" == 1 ]]; then info "SKIP (SIM)"
@@ -654,6 +688,7 @@ DONE=1
 
 step "CUTOVER COMPLETE"
 info "aside (keep until confident): $ASIDE   rollback: $0 --rollback $ASIDE"
+info "(that rollback also recovers a tree left half-switched by a killed run — see header)"
 info "No service restart needed: running bots keep their loaded code; the next restart loads identical files."
 info "Future deploys:  cd $REPO && git fetch origin && git merge --ff-only origin/master"
 info "Then restart legs ONLY via tools/leg_safe_restart.py <instance>."

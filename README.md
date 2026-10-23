@@ -22,6 +22,19 @@ pip install -e .
 python -c "from exchange.env import get_env; print(get_env())"   # -> 'testnet'
 ```
 
+### Per-leg setup (required on a fresh clone)
+A clone ships only `config/*.example.yaml` templates (every value `null`); the
+bot refuses to boot until each leg you run has a filled file. For each leg
+(`v1` → `params.yaml`, `donchian` → `params_donchian.yaml`,
+`sol_supertrend` → `params_sol_supertrend.yaml`):
+```bash
+cp config/<name>.example.yaml config/<name>.yaml   # e.g. params_donchian
+$EDITOR config/<name>.yaml                          # replace EVERY null — meanings in config/README.md
+cp .env.example .env.<instance>                     # per-leg keys, if the leg uses a sub-account (use .env.<instance>.example where one exists)
+python -m bot --instance <instance> --check-config  # must print CONFIG OK
+```
+Do not start or enable any unit until `--check-config` prints `CONFIG OK` for that leg.
+
 ## Layout
 | Path | Purpose |
 |---|---|

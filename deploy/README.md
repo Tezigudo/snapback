@@ -21,6 +21,13 @@ sudo nano /etc/snapback-btc/.env   # fill mainnet keys, BINANCE_ENV=mainnet
 sudo touch /opt/snapback-btc/confirm_mainnet.lock
 sudo chown snapback:snapback /opt/snapback-btc/confirm_mainnet.lock
 
+# Per-leg params: a clone has only config/*.example.yaml (all null). For each leg:
+#   cp config/<name>.example.yaml config/<name>.yaml && $EDITOR config/<name>.yaml
+#   (fill EVERY null — see config/README.md; per-leg keys go in .env.<instance>,
+#    copied from .env.example), then:
+.venv/bin/python -m bot --instance v1 --check-config   # must print CONFIG OK
+# Do not enable/start a unit until its leg prints CONFIG OK.
+
 sudo cp deploy/snapback-btc.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable snapback-btc
