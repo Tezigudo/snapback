@@ -23,3 +23,4 @@ def seed_no_stop_state(b, bot_cls) -> None:
     b._sl_fail_mem = {}
     b._no_stop_alert_ts = 0.0
     b._unverified_next = 0.0
+    b._entries_paused_seen = False

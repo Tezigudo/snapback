@@ -101,6 +101,7 @@ from exchange.env import (
     halt_source,
     is_halted,
     leg_halt_path,
+    leg_pause_path,
     load_env_for_instance,
 )
 from risk import (
@@ -379,6 +380,7 @@ class Bot:
         self.constraints: ExchangeConstraints = DEFAULT_CONSTRAINTS
         self._stopped = False
         self._last_signal_ts: pd.Timestamp | None = None
+        self._entries_paused_seen = False
         # B2 (boot-resume): prepared by _boot_resume_verdict on the ARMED adopt
         # path only, consumed by _seed_adopted_tracking. None otherwise.
         self._adopt_signal_ts_seed: pd.Timestamp | None = None
@@ -865,6 +867,7 @@ class Bot:
             return  # don't even enqueue heartbeats if no consumer
         try:
             payload: dict = {"halt_present": is_halted(self.instance),
+                             "entries_paused": leg_pause_path(self.instance).exists(),
                              "outbox_size_before_drain": state.outbox_size()}
             # Include the most recent gate-status snapshot so the dashboard
             # can show "what's true now / waiting on what" without operator
@@ -1318,6 +1321,25 @@ class Bot:
         except Exception as e:
             self.log.warning("could not persist last_entry_bar_ts=%s: %s", last_ts, e)
 
+    def _entries_paused(self) -> bool:
+        """Operator entry pause: data/PAUSE_<instance> exists. Blocks NEW
+        entries only; exits, stops and monitoring are untouched. Alerts once
+        on each pause/resume edge so a forgotten flag is visible."""
+        paused = leg_pause_path(self.instance).exists()
+        if paused != self._entries_paused_seen:
+            self._entries_paused_seen = paused
+            flag = f"data/PAUSE_{self.instance}"
+            if paused:
+                self.log.warning("entries PAUSED (%s present)", flag)
+                send_alert(f"{self.instance}: entries PAUSED",
+                           f"{flag} is present, so no new position will be opened. "
+                           "Exits and stops still run. Remove the file to resume.")
+            else:
+                self.log.warning("entries RESUMED (%s removed)", flag)
+                send_alert(f"{self.instance}: entries RESUMED",
+                           f"{flag} was removed; new entries are allowed again.")
+        return paused
+
     def _maybe_enter(self, equity: float) -> None:
         # No new entry while a no-stop emergency is unresolved or the no-stop
         # latch is on. Local-DB reads only — no exchange call on a healthy tick.
@@ -1326,6 +1348,8 @@ class Bot:
         # Skip entry evaluation if already in a position — bracket SL/TP
         # manage the existing trade. Matches backtest's exclusive_orders=True.
         if self.client.fetch_position(self.symbol).side != "flat":
+            return
+        if self._entries_paused():
             return
 
         # Daily-loss breaker: tighter (params risk.max_daily_loss_pct) daily-resetting
