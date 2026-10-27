@@ -381,6 +381,9 @@ class Bot:
         self._stopped = False
         self._last_signal_ts: pd.Timestamp | None = None
         self._entries_paused_seen = False
+        # Last time this leg was seen holding a position (or closed one
+        # itself). See _consume_held_bars.
+        self._position_held_at: float | None = None
         # B2 (boot-resume): prepared by _boot_resume_verdict on the ARMED adopt
         # path only, consumed by _seed_adopted_tracking. None otherwise.
         self._adopt_signal_ts_seed: pd.Timestamp | None = None
@@ -1321,6 +1324,30 @@ class Bot:
         except Exception as e:
             self.log.warning("could not persist last_entry_bar_ts=%s: %s", last_ts, e)
 
+    def _consume_held_bars(self) -> None:
+        """On the first flat tick after a position, mark every bar that had
+        CLOSED while it was held as already evaluated.
+
+        The bar guard below only advances when a bar is evaluated, and nothing
+        is evaluated while in a position. So when a stop or target filled
+        mid-bar, the next tick evaluated the bar that closed BEFORE the fill,
+        minutes stale, and could enter on it at a later price (live 2026-10-22:
+        SL at 02:27:55, long at 02:28:00 on the 02:00 bar). The backtest can't:
+        a bar that closes with the position open is never an entry bar there,
+        and an exit at a bar's close re-enters at the next bar at the earliest.
+        Bars are keyed by OPEN time (naive UTC, as fetch_ohlcv indexes them),
+        so the last bar closed at time t opens at floor(t, bar) - bar.
+        """
+        held_at = self._position_held_at
+        if held_at is None:
+            return
+        self._position_held_at = None
+        bs = self.bar_seconds
+        ts = pd.Timestamp((int(held_at) // bs) * bs - bs, unit="s")
+        if self._last_signal_ts is None or ts > self._last_signal_ts:
+            self._last_signal_ts = ts
+            self._persist_last_signal_ts(ts)
+
     def _entries_paused(self) -> bool:
         """Operator entry pause: data/PAUSE_<instance> exists. Blocks NEW
         entries only; exits, stops and monitoring are untouched. Alerts once
@@ -1348,7 +1375,9 @@ class Bot:
         # Skip entry evaluation if already in a position — bracket SL/TP
         # manage the existing trade. Matches backtest's exclusive_orders=True.
         if self.client.fetch_position(self.symbol).side != "flat":
+            self._position_held_at = time.time()
             return
+        self._consume_held_bars()
         if self._entries_paused():
             return
 
@@ -3127,7 +3156,9 @@ class Bot:
                 # _maybe_channel_exit → _maybe_enter, so on one tick the channel
                 # or trend exit can record its own close and _maybe_enter can
                 # then open at a new price (it never advanced _last_signal_ts
-                # while the position was open, so the bar guard lets it through).
+                # while the position was open, so the bar guard let it through;
+                # since 2026-10-27 _consume_held_bars blocks that same-bar
+                # re-entry, and this guard stays as the ledger's backstop).
                 # The next tick sees a changed entry_price and would emit a
                 # SECOND exit for a position already closed in the ledger —
                 # corrupting it in the opposite direction from the dropped exit
@@ -3784,6 +3815,7 @@ class Bot:
                 root = state.latest_entry_coid_root()
                 self.log.info("Time-stop firing after %.1f hours (root=%s)",
                               age_s / 3600, root or "—")
+                self._position_held_at = time.time()
                 order = self.client.close_position(
                     self.symbol, client_order_id_root=root, close_leg="x")
                 exit_price = self._resolve_fill_price(order)
@@ -3863,6 +3895,9 @@ class Bot:
                           "close=%.2f dbg=%s",
                           fill_reason, pos.side, root or "—", dbg.get("reason"),
                           dbg.get("cur_close", float("nan")), dbg)
+            # A bot close on this tick consumes the bar it was decided on, so
+            # _maybe_enter can't re-enter on that same bar later in the tick.
+            self._position_held_at = time.time()
             order = self.client.close_position(
                 self.symbol, client_order_id_root=root, close_leg="ce")
             exit_price = self._resolve_fill_price(order)
