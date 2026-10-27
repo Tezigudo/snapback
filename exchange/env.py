@@ -124,6 +124,14 @@ def leg_halt_path(instance: str) -> Path:
     return REPO_ROOT / "data" / f"HALT_{instance}"
 
 
+def leg_pause_path(instance: str) -> Path:
+    """This leg's ENTRY-PAUSE flag (`data/PAUSE_<instance>`). Operator-only.
+    While it exists the leg opens no new position; everything else keeps
+    running (heartbeat, exits, stops, monitoring). Unlike HALT it neither
+    flattens nor exits, and removing it resumes entries without a restart."""
+    return REPO_ROOT / "data" / f"PAUSE_{instance}"
+
+
 def halt_source(instance: str | None = None) -> str | None:
     """Which HALT flag (if any) is active for this leg.
 

@@ -94,6 +94,7 @@ def _make_bot():
     b.instance = "test"
     b.symbol = "BTC/USDT:USDT"
     b.entry_tf = "4h"
+    b.bar_seconds = 4 * 3600
     b.dry_run = False
     b.client = MagicMock()
     b.client.fetch_ohlcv.return_value = pd.DataFrame()   # len<250 → returns

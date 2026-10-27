@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from exchange.env import halt_source, is_halted  # per-leg HALT semantics
+from exchange.env import halt_source, is_halted, leg_pause_path  # per-leg HALT/PAUSE semantics
 
 LOCAL_TZ = ZoneInfo("Asia/Bangkok")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +198,8 @@ def render_html(db: dict, logs: list[dict], instance: str = "v1") -> str:
         halt_note = f"self data/HALT_{instance}"
     else:
         halt_note = ""
+    # Operator entry pause (data/PAUSE_<instance>): alive, but opens nothing.
+    paused = leg_pause_path(instance).exists()
     mainnet_locked = LOCK_FLAG.exists()
 
     meta = db["meta"]
@@ -257,6 +259,8 @@ def render_html(db: dict, logs: list[dict], instance: str = "v1") -> str:
         status_label, status_class = "ALIVE", "ok"
     else:
         status_label, status_class = "DEAD", "bad"
+    if alive and paused:
+        status_label, status_class = "PAUSED", "warn"
     if halted:
         status_label, status_class = "HALTED", "warn"
 
@@ -322,7 +326,9 @@ def render_html(db: dict, logs: list[dict], instance: str = "v1") -> str:
                            else "—")
     generated_at = epoch_to_local(now_utc)
     hb_text = fmt_age(hb_age) if hb_age is not None else "never"
-    status_sub = f"HALT: {halt_note}" if halted else f"Heartbeat {hb_text}"
+    status_sub = (f"HALT: {halt_note}" if halted
+                  else f"Entries paused (data/PAUSE_{instance}) · heartbeat {hb_text}"
+                  if paused else f"Heartbeat {hb_text}")
     deploy_text = to_local(deploy_start_ts) if deploy_start_ts else "—"
     mode_text = "MAINNET" + (" 🔒" if mainnet_locked else "")
 

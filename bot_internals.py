@@ -117,6 +117,22 @@ def trend_exit_signal(
     return channel_exit_signal(bars, position_side, params)
 
 
+def last_closed_bar_open(t: float, bar_seconds: int) -> pd.Timestamp:
+    """Open time (naive UTC, as fetch_ohlcv indexes bars) of the last bar that
+    had CLOSED at epoch time t: floor(t, bar) - bar. PURE."""
+    return pd.Timestamp((int(t) // bar_seconds) * bar_seconds - bar_seconds, unit="s")
+
+
+# Backtests whose next() falls through to the entry logic on the bar a time
+# stop closed (DonchianBreakoutBTCv3.next, mirroring live). Every other leg's
+# backtest returns after the close, so it can't re-enter until the next bar.
+_TIME_STOP_REENTERS_SAME_BAR = frozenset({"donchian-v3"})
+
+
+def time_stop_reenters_same_bar(strategy_name: str) -> bool:
+    return strategy_name in _TIME_STOP_REENTERS_SAME_BAR
+
+
 def trend_exit_fill_reason(strategy_name: str) -> str:
     """The `reason` string recorded on the fill/telemetry when the trend-exit
     hook fires.
@@ -1067,8 +1083,9 @@ def signal_bar_seed(persisted_raw: str | None, entry_fill_ts_raw: str | None,
     """B2: the `_last_signal_ts` an ADOPTED position must resume with. PURE.
 
     Candidates, latest wins:
-      - `last_entry_bar_ts` meta — the last closed bar _maybe_enter evaluated
-        before the restart (exactly what the in-memory value held).
+      - `last_entry_bar_ts` meta — the in-memory `_last_signal_ts` before the
+        restart: the last closed bar _maybe_enter evaluated OR consumed (a bar
+        that closed while a position was held, see Bot._consume_held_bars).
       - fallback from the newest entry fill: floor(fill_ts, bar) − 1 bar. The
         fill lands inside the bar AFTER the signal bar (entry is evaluated on
         the last CLOSED bar, index = bar OPEN time), so the signal bar is one

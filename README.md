@@ -61,7 +61,9 @@ Do not start or enable any unit until `--check-config` prints `CONFIG OK` for th
    `risk:` block — no code defaults; missing/null/out-of-range refuses boot
    (exit 78). Symbol allowlist stays in `risk.py`. Edits to `risk:` are NOT
    guarded by the pre-commit hook — treat them as a risk review.
-4. `data/HALT` file = bot closes all and exits clean
+4. `data/HALT` file = bot closes all and exits clean. `data/PAUSE_<instance>` =
+   that leg opens no new position but keeps running (exits, stops, monitoring);
+   delete the file to resume, no restart needed
 5. Git pre-commit hook rejects `risk.py` edits without `RISK_REVIEW=1`
 
 ## Status

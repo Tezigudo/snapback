@@ -5,7 +5,9 @@ Schema:
     'deploy_start_equity'       : float
     'deploy_start_ts'           : ISO ts
     'last_entry_bar_ts'         : ISO ts (naive UTC, bar OPEN) of the last CLOSED bar
-                                  _maybe_enter evaluated. Written every time
+                                  _maybe_enter evaluated, or consumed because it
+                                  closed while a position was held / entries
+                                  were paused. Written every time
                                   _last_signal_ts advances; read by boot-resume
                                   (adopt path ONLY) to stop a same-bar re-entry.
     'boot_adopt_log'            : JSON {signal_id, count, first_ts} — boot-resume

@@ -13,6 +13,7 @@ verify wiring before flipping to live orders.
 Loop (every poll_interval_s):
   1. heartbeat: touch data/heartbeat
   2. check data/HALT → if present, flatten + exit
+     (data/PAUSE_<instance> → no new entries, everything else runs)
   3. fetch equity → if equity / deploy_start < kill_switch_fraction → HALT
   4. fetch latest 15m bars + funding
   5. if no open position AND signal fires on last closed bar → place bracket
@@ -65,6 +66,7 @@ from bot_internals import (
     channel_exit_signal,  # noqa: F401  (re-exported; tools import it from here)
     evaluate_for_strategy,
     gate_status,
+    last_closed_bar_open,
     limit_entry_price,
     order_avg_price,
     require_strategy_available,
@@ -74,6 +76,7 @@ from bot_internals import (
     strategy_uses_channel_exit,
     strategy_uses_trend_exit,
     time_stop_due,
+    time_stop_reenters_same_bar,
     trend_exit_fill_reason,
     trend_exit_signal,
 )
@@ -101,6 +104,7 @@ from exchange.env import (
     halt_source,
     is_halted,
     leg_halt_path,
+    leg_pause_path,
     load_env_for_instance,
 )
 from risk import (
@@ -379,6 +383,12 @@ class Bot:
         self.constraints: ExchangeConstraints = DEFAULT_CONSTRAINTS
         self._stopped = False
         self._last_signal_ts: pd.Timestamp | None = None
+        self._entries_paused_seen = False
+        self._pause_alert_retry_at = 0.0
+        self._pause_alert_tries = 0
+        # Last time this leg was seen holding a position (or closed one
+        # itself). See _consume_held_bars.
+        self._position_held_at: float | None = None
         # B2 (boot-resume): prepared by _boot_resume_verdict on the ARMED adopt
         # path only, consumed by _seed_adopted_tracking. None otherwise.
         self._adopt_signal_ts_seed: pd.Timestamp | None = None
@@ -865,6 +875,7 @@ class Bot:
             return  # don't even enqueue heartbeats if no consumer
         try:
             payload: dict = {"halt_present": is_halted(self.instance),
+                             "entries_paused": self._pause_flag_present(),
                              "outbox_size_before_drain": state.outbox_size()}
             # Include the most recent gate-status snapshot so the dashboard
             # can show "what's true now / waiting on what" without operator
@@ -1318,6 +1329,88 @@ class Bot:
         except Exception as e:
             self.log.warning("could not persist last_entry_bar_ts=%s: %s", last_ts, e)
 
+    def _note_held(self, t: float) -> None:
+        """The leg held a position at epoch time t (never moves backwards)."""
+        if self._position_held_at is None or t > self._position_held_at:
+            self._position_held_at = t
+
+    def _consume_bars_closed_by(self, t: float) -> None:
+        """Advance the entry bar guard past every bar closed by time t."""
+        ts = last_closed_bar_open(t, self.bar_seconds)
+        if self._last_signal_ts is None or ts > self._last_signal_ts:
+            self._last_signal_ts = ts
+            self._persist_last_signal_ts(ts)
+
+    def _consume_held_bars(self) -> None:
+        """On the first flat tick after a position, mark every bar that had
+        CLOSED while it was held as already evaluated.
+
+        The bar guard below only advances when a bar is evaluated, and nothing
+        is evaluated while in a position. So when a stop or target filled
+        mid-bar, the next tick evaluated the bar that closed BEFORE the fill,
+        minutes stale, and could enter on it at a later price (live 2026-10-22:
+        SL at 02:27:55, long at 02:28:00 on the 02:00 bar). The backtest can't:
+        a bar that closes with the position open is never an entry bar there,
+        and an exit at a bar's close re-enters at the next bar at the earliest.
+
+        "Held until" is the latest of: the exchange time of the exit fill
+        (_detect_bracket_exit), the start of the last tick that saw the
+        position open (taken BEFORE the read, so a slow reply can't push it
+        past a bar close), and a bot-initiated close. Only when the exit fill
+        can't be read on the flat tick does it fall back to the last open tick.
+        """
+        held_at = self._position_held_at
+        if held_at is None:
+            return
+        self._consume_bars_closed_by(held_at)
+        self._position_held_at = None   # only once consumed: a raise keeps it
+
+    PAUSE_ALERT_RETRY_S = 300.0
+    PAUSE_ALERT_MAX_TRIES = 3
+
+    def _pause_flag_present(self) -> bool:
+        """data/PAUSE_<instance> exists. Never raises: an unreadable data/
+        (Path.exists re-raises EACCES/EIO) counts as PAUSED, closed for
+        entries only, so it can't abort a tick or let an entry through."""
+        try:
+            return leg_pause_path(self.instance).exists()
+        except OSError as e:
+            self.log.warning("pause flag unreadable (%s): treating as paused", e)
+            return True
+
+    def _entries_paused(self) -> bool:
+        """Operator entry pause: data/PAUSE_<instance> exists. Blocks NEW
+        entries only; exits, stops and monitoring are untouched. Alerts once
+        on each pause/resume edge so a forgotten flag is visible."""
+        paused = self._pause_flag_present()
+        now = time.time()
+        if paused != self._entries_paused_seen and now >= self._pause_alert_retry_at:
+            flag = f"data/PAUSE_{self.instance}"
+            if paused:
+                self.log.warning("entries PAUSED (%s present)", flag)
+                sent = send_alert(f"{self.instance}: entries PAUSED",
+                                  f"{flag} is present, so no new position will be "
+                                  "opened. Exits and stops still run. Remove the "
+                                  "file to resume.")
+            else:
+                self.log.warning("entries RESUMED (%s removed)", flag)
+                sent = send_alert(f"{self.instance}: entries RESUMED",
+                                  f"{flag} was removed; new entries are allowed again.")
+            # The edge counts as reported once the alert went out, or after
+            # PAUSE_ALERT_MAX_TRIES failed sends (SMTP down/unconfigured), retried
+            # every PAUSE_ALERT_RETRY_S. The gate reads the file itself, so a
+            # retry never delays the pause.
+            self._pause_alert_tries = 0 if sent else self._pause_alert_tries + 1
+            if sent or self._pause_alert_tries >= self.PAUSE_ALERT_MAX_TRIES:
+                if not sent:
+                    self.log.error("pause alert undeliverable after %d tries; "
+                                   "giving up on this edge", self._pause_alert_tries)
+                self._entries_paused_seen = paused
+                self._pause_alert_tries = 0
+            else:
+                self._pause_alert_retry_at = now + self.PAUSE_ALERT_RETRY_S
+        return paused
+
     def _maybe_enter(self, equity: float) -> None:
         # No new entry while a no-stop emergency is unresolved or the no-stop
         # latch is on. Local-DB reads only — no exchange call on a healthy tick.
@@ -1325,7 +1418,15 @@ class Bot:
             return
         # Skip entry evaluation if already in a position — bracket SL/TP
         # manage the existing trade. Matches backtest's exclusive_orders=True.
+        t0 = time.time()   # before the read: a position seen open was open at t0
         if self.client.fetch_position(self.symbol).side != "flat":
+            self._note_held(t0)
+            return
+        self._consume_held_bars()
+        if self._entries_paused():
+            # A paused leg trades no bar, so removing the flag must not open on
+            # a bar that closed during the pause.
+            self._consume_bars_closed_by(t0)
             return
 
         # Daily-loss breaker: tighter (params risk.max_daily_loss_pct) daily-resetting
@@ -1428,6 +1529,12 @@ class Bot:
             )
             return
 
+        # The flag may have appeared during evaluation: last look before the
+        # order (one stat). The edge alert follows on the next tick.
+        if self._pause_flag_present():
+            self.log.warning("entry %s sid=%s skipped: entries paused",
+                             decision.side, signal_id)
+            return
         try:
             self._place_live_entry(decision, qty, signal_id, equity)
         except Exception as e:
@@ -2997,8 +3104,13 @@ class Bot:
         # to record — see _hold_unrecorded_exit.
         retain: tuple[str, float | None, float | None, str | None] | None = None
         try:
+            t0 = time.time()
             pos = self.client.fetch_position(self.symbol)
             current = pos.side
+            if current not in ("flat", "unknown"):
+                # Every tick, even one _maybe_enter never reaches (entries
+                # blocked, equity unreadable): see _consume_held_bars.
+                self._note_held(t0)
 
             prev_side = self._last_position_side
             prev_entry = self._last_position_entry
@@ -3103,7 +3215,9 @@ class Bot:
                 # _maybe_channel_exit → _maybe_enter, so on one tick the channel
                 # or trend exit can record its own close and _maybe_enter can
                 # then open at a new price (it never advanced _last_signal_ts
-                # while the position was open, so the bar guard lets it through).
+                # while the position was open, so the bar guard let it through;
+                # since 2026-10-27 _consume_held_bars blocks that same-bar
+                # re-entry, and this guard stays as the ledger's backstop).
                 # The next tick sees a changed entry_price and would emit a
                 # SECOND exit for a position already closed in the ledger —
                 # corrupting it in the opposite direction from the dropped exit
@@ -3226,6 +3340,15 @@ class Bot:
                     signal_id,
                 )
                 return
+            try:
+                fill_ms = float(exit_trade.get("timestamp") or 0.0)
+            except (TypeError, ValueError):
+                fill_ms = 0.0
+            if fill_ms > 0 and math.isfinite(fill_ms):
+                # Held until the fill: the next entry bar is the one this fill
+                # landed in, as in the backtest. max() in _note_held makes an
+                # older, mismatched trade harmless.
+                self._note_held(fill_ms / 1000.0)
             exit_price = float(exit_trade.get("price") or 0.0)
             if exit_price <= 0:
                 return
@@ -3760,6 +3883,15 @@ class Bot:
                 root = state.latest_entry_coid_root()
                 self.log.info("Time-stop firing after %.1f hours (root=%s)",
                               age_s / 3600, root or "—")
+                now = time.time()
+                if time_stop_reenters_same_bar(self.strategy_name):
+                    # Its backtest closes on this bar's close and may enter on
+                    # the SAME bar: count the position as gone just before that
+                    # close (overrides this tick's earlier stamp).
+                    self._position_held_at = (
+                        (int(now) // self.bar_seconds) * self.bar_seconds - 1)
+                else:
+                    self._note_held(now)
                 order = self.client.close_position(
                     self.symbol, client_order_id_root=root, close_leg="x")
                 exit_price = self._resolve_fill_price(order)
@@ -3839,6 +3971,9 @@ class Bot:
                           "close=%.2f dbg=%s",
                           fill_reason, pos.side, root or "—", dbg.get("reason"),
                           dbg.get("cur_close", float("nan")), dbg)
+            # A bot close on this tick consumes the bar it was decided on, so
+            # _maybe_enter can't re-enter on that same bar later in the tick.
+            self._note_held(time.time())
             order = self.client.close_position(
                 self.symbol, client_order_id_root=root, close_leg="ce")
             exit_price = self._resolve_fill_price(order)
@@ -4103,6 +4238,7 @@ class Bot:
         # (close_position's default sweep-then-close would leave it with no
         # stop and no TP, and a retry that finds price back above breakeven
         # would restore only the -sb stop — the TP lost for good.)
+        self._note_held(time.time())
         order = self.client.close_position(self.symbol, client_order_id_root=root,
                                            close_leg="be", sweep_first=False)
         try:
@@ -4239,6 +4375,10 @@ class Bot:
                     # passes with zero "WOULD re-place" lines.
                     self._maybe_reprotect(equity)
                     self._maybe_backfill_close_prices()
+                # Pause/resume alert on the edge even while a position is held
+                # (the entry gate itself is in _maybe_enter). AFTER the exits,
+                # so a slow alert send can never delay a risk-reducing close.
+                self._entries_paused()
                 if not equity_known:
                     transient_backoff_s = min(transient_backoff_s * 2, 30)
                     time.sleep(transient_backoff_s)
