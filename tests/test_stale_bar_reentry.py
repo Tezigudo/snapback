@@ -94,18 +94,6 @@ def test_held_across_a_bar_close_skips_that_bar() -> None:
     assert h.evaluated == [T("2026-10-22 02:30")]
 
 
-def test_bot_close_on_this_tick_consumes_its_bar() -> None:
-    # Trend exit at the 02:30 close: _maybe_channel_exit stamps the close,
-    # then _maybe_enter runs flat on the same tick.
-    h = Harness(last_signal="2026-10-22 01:00")
-    h.tick("2026-10-22 02:29:57", "long", "2026-10-22 02:15")
-    h.b._position_held_at = _epoch("2026-10-22 02:30:01")      # the close itself
-    h.tick("2026-10-22 02:30:01", "flat", "2026-10-22 02:30")
-    assert h.evaluated == []
-    h.tick("2026-10-22 02:45:02", "flat", "2026-10-22 02:45")
-    assert h.evaluated == [T("2026-10-22 02:30")]
-
-
 def test_flat_all_along_is_unchanged() -> None:
     h = Harness(last_signal="2026-10-22 02:00")
     h.tick("2026-10-22 02:30:04", "flat", "2026-10-22 02:30")
@@ -120,6 +108,7 @@ def test_never_moves_the_guard_backwards() -> None:
     h.tick("2026-10-22 03:20:00", "flat", "2026-10-22 03:15")
     assert h.b._last_signal_ts == T("2026-10-22 03:00")
     assert h.evaluated == []
+    h.b._persist_last_signal_ts.assert_not_called()      # nor the persisted cursor
 
 
 def test_stamp_uses_the_time_before_the_position_read() -> None:

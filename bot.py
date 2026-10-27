@@ -384,6 +384,7 @@ class Bot:
         self._stopped = False
         self._last_signal_ts: pd.Timestamp | None = None
         self._entries_paused_seen = False
+        self._pause_alert_retry_at = 0.0
         # Last time this leg was seen holding a position (or closed one
         # itself). See _consume_held_bars.
         self._position_held_at: float | None = None
@@ -1363,23 +1364,33 @@ class Bot:
         self._position_held_at = None
         self._consume_bars_closed_by(held_at)
 
+    PAUSE_ALERT_RETRY_S = 300.0
+
     def _entries_paused(self) -> bool:
         """Operator entry pause: data/PAUSE_<instance> exists. Blocks NEW
         entries only; exits, stops and monitoring are untouched. Alerts once
         on each pause/resume edge so a forgotten flag is visible."""
         paused = leg_pause_path(self.instance).exists()
-        if paused != self._entries_paused_seen:
-            self._entries_paused_seen = paused
+        now = time.time()
+        if paused != self._entries_paused_seen and now >= self._pause_alert_retry_at:
             flag = f"data/PAUSE_{self.instance}"
             if paused:
                 self.log.warning("entries PAUSED (%s present)", flag)
-                send_alert(f"{self.instance}: entries PAUSED",
-                           f"{flag} is present, so no new position will be opened. "
-                           "Exits and stops still run. Remove the file to resume.")
+                sent = send_alert(f"{self.instance}: entries PAUSED",
+                                  f"{flag} is present, so no new position will be "
+                                  "opened. Exits and stops still run. Remove the "
+                                  "file to resume.")
             else:
                 self.log.warning("entries RESUMED (%s removed)", flag)
-                send_alert(f"{self.instance}: entries RESUMED",
-                           f"{flag} was removed; new entries are allowed again.")
+                sent = send_alert(f"{self.instance}: entries RESUMED",
+                                  f"{flag} was removed; new entries are allowed again.")
+            # The edge counts as reported only once the alert went out; a failed
+            # send retries every PAUSE_ALERT_RETRY_S (the gate above uses the
+            # file itself, so a retry never delays the pause).
+            if sent:
+                self._entries_paused_seen = paused
+            else:
+                self._pause_alert_retry_at = now + self.PAUSE_ALERT_RETRY_S
         return paused
 
     def _maybe_enter(self, equity: float) -> None:
@@ -1500,6 +1511,12 @@ class Bot:
             )
             return
 
+        # The flag may have appeared during evaluation: last look before the
+        # order (one stat). The edge alert follows on the next tick.
+        if leg_pause_path(self.instance).exists():
+            self.log.warning("entry %s sid=%s skipped: entries paused",
+                             decision.side, signal_id)
+            return
         try:
             self._place_live_entry(decision, qty, signal_id, equity)
         except Exception as e:

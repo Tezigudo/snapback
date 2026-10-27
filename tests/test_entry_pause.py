@@ -114,6 +114,43 @@ def test_loop_alerts_the_pause_edge_while_a_position_is_held(tmp_path, flag) -> 
     assert alert.call_count == 1
 
 
+def test_failed_alert_is_retried_not_dropped(tmp_path, flag) -> None:
+    flag.touch()
+    b = _bot(tmp_path)
+    with patch("bot.send_alert", return_value=False) as alert, \
+            patch("bot.time.time", return_value=1000.0):
+        assert b._entries_paused() is True          # gate holds even if unsent
+        assert b._entries_paused() is True          # throttled: no resend yet
+    assert alert.call_count == 1
+    with patch("bot.send_alert", return_value=True) as alert, \
+            patch("bot.time.time", return_value=1000.0 + bot.Bot.PAUSE_ALERT_RETRY_S):
+        b._entries_paused()
+        b._entries_paused()
+    assert alert.call_count == 1                    # retried once, then reported
+
+
+def test_flag_created_during_evaluation_blocks_the_order(tmp_path, flag) -> None:
+    b = _bot(tmp_path)
+    b.dry_run = False
+    b.risk_pct, b.leverage, b.order_type = 1.0, 5, "market"
+    b.constraints = bot.DEFAULT_CONSTRAINTS
+    b._place_live_entry = MagicMock()
+    b.client.fetch_ohlcv.return_value = __import__(
+        "tests.test_stale_bar_reentry", fromlist=["_bars"])._bars("2026-10-22 02:30")
+    decision = SimpleNamespace(side="long", price=65000.0, sl_distance=650.0,
+                               sl_price=64350.0, tp_price=66950.0, debug={})
+
+    def _eval(*a, **k):
+        flag.touch()                                # operator pauses mid-evaluation
+        return decision
+
+    with patch("bot.evaluate_for_strategy", side_effect=_eval), \
+            patch("bot.gate_status", return_value={}), patch("bot.send_alert"), \
+            patch("bot.check_notional"):
+        b._maybe_enter(150.0)
+    b._place_live_entry.assert_not_called()
+
+
 def test_no_flag_no_alert(tmp_path, flag) -> None:
     b = _bot(tmp_path)
     b.client.fetch_ohlcv.side_effect = RuntimeError("evaluated")
