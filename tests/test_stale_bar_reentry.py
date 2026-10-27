@@ -122,11 +122,128 @@ def test_never_moves_the_guard_backwards() -> None:
     assert h.evaluated == []
 
 
-@pytest.mark.parametrize("site", ["time_stop", "trend_exit"])
-def test_bot_close_sites_stamp_before_closing(site) -> None:
-    src = open(bot.__file__).read()
-    leg = {"time_stop": 'close_leg="x")', "trend_exit": 'close_leg="ce")'}[site]
-    head = src[:src.index(leg)]
-    call = head.rindex("self.client.close_position(")
-    stamp = head.rindex("self._position_held_at = time.time()")
-    assert 0 < call - stamp < 400
+def test_stamp_uses_the_time_before_the_position_read() -> None:
+    # The read is sent at 02:29:58 (held), the SL fills 02:29:59.5 inside the
+    # 02:15 bar, and a slow reply lands at 02:30:01. Stamping the reply time
+    # would consume the 02:15 bar, which the backtest can trade.
+    h = Harness(last_signal="2026-10-22 01:00")
+    clock = [_epoch("2026-10-22 02:29:58")]
+
+    def _slow_read(_symbol):
+        clock[0] = _epoch("2026-10-22 02:30:01")
+        return SimpleNamespace(side="long")
+
+    h.b.client.fetch_position.side_effect = _slow_read
+    with patch("bot.time.time", side_effect=lambda: clock[0]):
+        h.b._maybe_enter(150.0)
+    assert h.b._position_held_at == _epoch("2026-10-22 02:29:58")
+    h.b.client.fetch_position.side_effect = None
+    h.tick("2026-10-22 02:30:06", "flat", "2026-10-22 02:30")
+    assert h.evaluated == [T("2026-10-22 02:15")]
+
+
+# --------------------------------------------------------------------------
+# The real close paths, on a real Bot (tests/test_orphan_bracket_cleanup.py's
+# factory; conftest gives every test an isolated state DB).
+# --------------------------------------------------------------------------
+
+from exchange import state  # noqa: E402
+
+from .test_orphan_bracket_cleanup import _flat, _make_bot, _open  # noqa: E402
+
+
+def _real_bot(strategy: str = "multifactor-v1"):
+    b, mc = _make_bot()
+    b.strategy_name = strategy
+    b.bar_seconds = 900
+    return b, mc
+
+
+def _stamp_at_close(b, mc) -> list:
+    seen: list = []
+
+    def _close(*a, **k):
+        seen.append(b._position_held_at)
+        raise RuntimeError("stop after the close call")
+
+    mc.close_position.side_effect = _close
+    return seen
+
+
+def test_detector_stamps_the_exit_fill_time_through_failing_ticks() -> None:
+    # Ticks fail 02:14:50-02:15:40 (last open tick 02:14:50); the SL fills at
+    # 02:15:10; the first good tick is 02:15:45. Without the fill time the
+    # guard would consume only the 01:45 bar and the 02:00 bar (closed 02:15
+    # with the position open) would be entered: the 2026-10-22 bug again.
+    b, mc = _real_bot()
+    b._last_position_side, b._last_position_entry = "long", 65000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "1234567890123"
+    b._position_held_at = _epoch("2026-10-22 02:14:50")
+    state.record_fill(side="long", qty=0.01, price=65000.0, reason="entry",
+                      client_order_id_root="1234567890123")
+    mc.fetch_position.return_value = _flat()
+    mc.ex.fetch_my_trades.return_value = [
+        {"side": "sell", "price": 64000.0,
+         "timestamp": int(_epoch("2026-10-22 02:15:10") * 1000)}]
+    with patch("bot.send_alert"), \
+            patch("bot.time.time", return_value=_epoch("2026-10-22 02:15:45")):
+        b._detect_bracket_exit(equity=140.0)
+    assert b._position_held_at == _epoch("2026-10-22 02:15:10")
+    b._consume_held_bars()
+    assert b._last_signal_ts == T("2026-10-22 02:00")
+
+
+def test_detector_stamps_every_open_tick_with_the_pre_read_time() -> None:
+    b, mc = _real_bot()
+    b._last_position_side = "long"
+    clock = [_epoch("2026-10-22 02:29:58")]
+
+    def _slow_read(_symbol):
+        clock[0] = _epoch("2026-10-22 02:30:01")
+        return _open("long")
+
+    mc.fetch_position.side_effect = _slow_read
+    with patch("bot.time.time", side_effect=lambda: clock[0]):
+        b._detect_bracket_exit(equity=140.0)
+    assert b._position_held_at == _epoch("2026-10-22 02:29:58")
+
+
+@pytest.mark.parametrize(("strategy", "consumed"), [
+    ("multifactor-v1", "2026-10-22 02:15"),   # backtest returns after the close
+    ("donchian-v3", "2026-10-22 02:00"),      # backtest may enter on the same bar
+])
+def test_time_stop_follows_each_legs_backtest(strategy, consumed) -> None:
+    b, mc = _real_bot(strategy)
+    b.params = {**b.params, "strategy": {**(b.params.get("strategy") or {}),
+                                         "max_hold_bars": 4}}
+    b._position_held_at = _epoch("2026-10-22 02:30:01")    # this tick's detector stamp
+    state.record_fill(side="long", qty=0.01, price=65000.0, reason="entry")
+    mc.fetch_position.return_value = _open("long")
+    seen = _stamp_at_close(b, mc)
+    with patch("bot.time_stop_due", return_value=True), \
+            patch("bot.time.time", return_value=_epoch("2026-10-22 02:30:02")), \
+            patch("bot.send_alert"):
+        try:
+            b._maybe_time_stop(equity=140.0)
+        except RuntimeError:
+            pass
+    assert len(seen) == 1                                    # stamped BEFORE closing
+    b._consume_held_bars()
+    assert b._last_signal_ts == T(consumed)
+
+
+def test_trend_exit_consumes_its_own_bar_before_closing() -> None:
+    b, mc = _real_bot("multifactor-v1")
+    mc.fetch_position.return_value = _open("long")
+    mc.fetch_ohlcv.return_value = _bars("2026-10-22 02:30")
+    seen = _stamp_at_close(b, mc)
+    with patch("bot.trend_exit_signal", return_value=(True, {"reason": "test"})), \
+            patch("bot.time.time", return_value=_epoch("2026-10-22 02:30:01")), \
+            patch("bot.send_alert"):
+        try:
+            b._maybe_channel_exit(equity=140.0)
+        except RuntimeError:
+            pass
+    assert seen == [_epoch("2026-10-22 02:30:01")]
+    b._consume_held_bars()
+    assert b._last_signal_ts == T("2026-10-22 02:15")
