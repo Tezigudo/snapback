@@ -236,3 +236,33 @@ def test_trend_exit_consumes_its_own_bar_before_closing() -> None:
     assert seen == [_epoch("2026-10-22 02:30:01")]
     b._consume_held_bars()
     assert b._last_signal_ts == T("2026-10-22 02:15")
+
+
+def test_breakeven_close_consumes_its_bar_before_closing() -> None:
+    b, mc = _real_bot("supertrend")
+    seen = _stamp_at_close(b, mc)
+    with patch("bot.time.time", return_value=_epoch("2026-10-22 08:00:02")), \
+            patch("bot.send_alert"):
+        try:
+            b._breakeven_close(_open("long"), "1234567890123", 65000.0, 1.0, 140.0)
+        except RuntimeError:
+            pass
+    assert seen == [_epoch("2026-10-22 08:00:02")]
+
+
+def test_odd_fill_timestamp_is_ignored_not_raised() -> None:
+    b, mc = _real_bot()
+    b._last_position_side, b._last_position_entry = "long", 65000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "1234567890123"
+    b._position_held_at = _epoch("2026-10-22 02:14:50")
+    state.record_fill(side="long", qty=0.01, price=65000.0, reason="entry",
+                      client_order_id_root="1234567890123")
+    mc.fetch_position.return_value = _flat()
+    mc.ex.fetch_my_trades.return_value = [
+        {"side": "sell", "price": 64000.0, "timestamp": "n/a"}]
+    with patch("bot.send_alert"):
+        b._detect_bracket_exit(equity=140.0)
+    assert b._position_held_at == _epoch("2026-10-22 02:14:50")
+    rows = __import__("sqlite3").connect(state.DB_PATH).execute(
+        "SELECT reason FROM fills ORDER BY id").fetchall()
+    assert rows[-1] == ("bracket_exit",)                    # exit still recorded

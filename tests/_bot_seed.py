@@ -25,4 +25,5 @@ def seed_no_stop_state(b, bot_cls) -> None:
     b._unverified_next = 0.0
     b._entries_paused_seen = False
     b._pause_alert_retry_at = 0.0
+    b._pause_alert_tries = 0
     b._position_held_at = None

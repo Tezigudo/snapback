@@ -38,6 +38,14 @@ def _bot(tmp_path, side: str = "flat"):
 
 
 @pytest.fixture
+def db(tmp_path):
+    from exchange import state
+    with patch("exchange.state.DB_PATH", tmp_path / "state.db"):
+        state.init_db()
+        yield
+
+
+@pytest.fixture
 def flag(tmp_path):
     p = tmp_path / "PAUSE_v1"
     with patch("bot.leg_pause_path", lambda inst: tmp_path / f"PAUSE_{inst}"):
@@ -105,13 +113,48 @@ def test_resume_never_enters_on_a_bar_closed_during_the_pause(tmp_path, flag) ->
     assert seen == [pd.Timestamp("2026-10-22 02:15")]
 
 
-def test_loop_alerts_the_pause_edge_while_a_position_is_held(tmp_path, flag) -> None:
-    """The edge check runs at tick start, not only on flat ticks."""
+def test_loop_checks_the_pause_edge_after_the_exits_while_held(db) -> None:
+    """One real loop() tick holding a position: the edge check runs (so a
+    PAUSED alert isn't held back until flat), and only AFTER every
+    risk-reducing exit, so a slow alert send can't delay a close."""
+    from .test_daily_anchor_midnight import D1, _make_bot, _ready_principal, _tick
+
+    b, bot_mod = _make_bot()
+    _ready_principal()
+    order: list[str] = []
+    for name in ("_maybe_time_stop", "_maybe_channel_exit", "_maybe_breakeven",
+                 "_maybe_reprotect"):
+        setattr(b, name, lambda *a, _n=name, **k: order.append(_n))
+    b._entries_paused = lambda: order.append("_entries_paused") or False
+    _tick(b, bot_mod, D1, 1000.0, "long")
+    assert order[-1] == "_entries_paused"
+    assert order.count("_entries_paused") == 1
+
+
+def test_unreadable_flag_counts_as_paused_and_never_raises(tmp_path) -> None:
+    class _Unreadable:
+        def exists(self):
+            raise PermissionError(13, "Permission denied")
+
+    b = _bot(tmp_path)
+    with patch("bot.leg_pause_path", lambda inst: _Unreadable()), \
+            patch("bot.send_alert", return_value=True):
+        assert b._pause_flag_present() is True
+        b._maybe_enter(150.0)
+    b.client.fetch_ohlcv.assert_not_called()
+
+
+def test_alert_retries_are_capped(tmp_path, flag) -> None:
     flag.touch()
-    b = _bot(tmp_path, side="long")
-    with patch("bot.send_alert") as alert:
-        assert b._entries_paused() is True
-    assert alert.call_count == 1
+    b = _bot(tmp_path)
+    tries = bot.Bot.PAUSE_ALERT_MAX_TRIES
+    with patch("bot.send_alert", return_value=False) as alert:
+        for i in range(tries + 3):
+            with patch("bot.time.time",
+                       return_value=1000.0 + i * bot.Bot.PAUSE_ALERT_RETRY_S):
+                assert b._entries_paused() is True
+    assert alert.call_count == tries
+    assert b._entries_paused_seen is True
 
 
 def test_failed_alert_is_retried_not_dropped(tmp_path, flag) -> None:

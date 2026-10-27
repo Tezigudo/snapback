@@ -385,6 +385,7 @@ class Bot:
         self._last_signal_ts: pd.Timestamp | None = None
         self._entries_paused_seen = False
         self._pause_alert_retry_at = 0.0
+        self._pause_alert_tries = 0
         # Last time this leg was seen holding a position (or closed one
         # itself). See _consume_held_bars.
         self._position_held_at: float | None = None
@@ -874,7 +875,7 @@ class Bot:
             return  # don't even enqueue heartbeats if no consumer
         try:
             payload: dict = {"halt_present": is_halted(self.instance),
-                             "entries_paused": leg_pause_path(self.instance).exists(),
+                             "entries_paused": self._pause_flag_present(),
                              "outbox_size_before_drain": state.outbox_size()}
             # Include the most recent gate-status snapshot so the dashboard
             # can show "what's true now / waiting on what" without operator
@@ -1361,16 +1362,27 @@ class Bot:
         held_at = self._position_held_at
         if held_at is None:
             return
-        self._position_held_at = None
         self._consume_bars_closed_by(held_at)
+        self._position_held_at = None   # only once consumed: a raise keeps it
 
     PAUSE_ALERT_RETRY_S = 300.0
+    PAUSE_ALERT_MAX_TRIES = 3
+
+    def _pause_flag_present(self) -> bool:
+        """data/PAUSE_<instance> exists. Never raises: an unreadable data/
+        (Path.exists re-raises EACCES/EIO) counts as PAUSED, closed for
+        entries only, so it can't abort a tick or let an entry through."""
+        try:
+            return leg_pause_path(self.instance).exists()
+        except OSError as e:
+            self.log.warning("pause flag unreadable (%s): treating as paused", e)
+            return True
 
     def _entries_paused(self) -> bool:
         """Operator entry pause: data/PAUSE_<instance> exists. Blocks NEW
         entries only; exits, stops and monitoring are untouched. Alerts once
         on each pause/resume edge so a forgotten flag is visible."""
-        paused = leg_pause_path(self.instance).exists()
+        paused = self._pause_flag_present()
         now = time.time()
         if paused != self._entries_paused_seen and now >= self._pause_alert_retry_at:
             flag = f"data/PAUSE_{self.instance}"
@@ -1384,11 +1396,17 @@ class Bot:
                 self.log.warning("entries RESUMED (%s removed)", flag)
                 sent = send_alert(f"{self.instance}: entries RESUMED",
                                   f"{flag} was removed; new entries are allowed again.")
-            # The edge counts as reported only once the alert went out; a failed
-            # send retries every PAUSE_ALERT_RETRY_S (the gate above uses the
-            # file itself, so a retry never delays the pause).
-            if sent:
+            # The edge counts as reported once the alert went out, or after
+            # PAUSE_ALERT_MAX_TRIES failed sends (SMTP down/unconfigured), retried
+            # every PAUSE_ALERT_RETRY_S. The gate reads the file itself, so a
+            # retry never delays the pause.
+            self._pause_alert_tries = 0 if sent else self._pause_alert_tries + 1
+            if sent or self._pause_alert_tries >= self.PAUSE_ALERT_MAX_TRIES:
+                if not sent:
+                    self.log.error("pause alert undeliverable after %d tries; "
+                                   "giving up on this edge", self._pause_alert_tries)
                 self._entries_paused_seen = paused
+                self._pause_alert_tries = 0
             else:
                 self._pause_alert_retry_at = now + self.PAUSE_ALERT_RETRY_S
         return paused
@@ -1513,7 +1531,7 @@ class Bot:
 
         # The flag may have appeared during evaluation: last look before the
         # order (one stat). The edge alert follows on the next tick.
-        if leg_pause_path(self.instance).exists():
+        if self._pause_flag_present():
             self.log.warning("entry %s sid=%s skipped: entries paused",
                              decision.side, signal_id)
             return
@@ -3322,12 +3340,15 @@ class Bot:
                     signal_id,
                 )
                 return
-            fill_ms = exit_trade.get("timestamp")
-            if fill_ms:
+            try:
+                fill_ms = float(exit_trade.get("timestamp") or 0.0)
+            except (TypeError, ValueError):
+                fill_ms = 0.0
+            if fill_ms > 0 and math.isfinite(fill_ms):
                 # Held until the fill: the next entry bar is the one this fill
                 # landed in, as in the backtest. max() in _note_held makes an
                 # older, mismatched trade harmless.
-                self._note_held(float(fill_ms) / 1000.0)
+                self._note_held(fill_ms / 1000.0)
             exit_price = float(exit_trade.get("price") or 0.0)
             if exit_price <= 0:
                 return
@@ -4287,9 +4308,6 @@ class Bot:
                                f"Bot exiting.")
                     return 0
 
-                # Pause/resume alert on the edge, even while a position is held
-                # (the entry gate itself stays in _maybe_enter). One stat().
-                self._entries_paused()
                 self._maybe_reconcile_principal()
                 equity_known = True
                 self._equity_stale = False
@@ -4357,6 +4375,10 @@ class Bot:
                     # passes with zero "WOULD re-place" lines.
                     self._maybe_reprotect(equity)
                     self._maybe_backfill_close_prices()
+                # Pause/resume alert on the edge even while a position is held
+                # (the entry gate itself is in _maybe_enter). AFTER the exits,
+                # so a slow alert send can never delay a risk-reducing close.
+                self._entries_paused()
                 if not equity_known:
                     transient_backoff_s = min(transient_backoff_s * 2, 30)
                     time.sleep(transient_backoff_s)
