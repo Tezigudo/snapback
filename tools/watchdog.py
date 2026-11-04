@@ -66,11 +66,13 @@ class LegSpec:
 
 
 LEGS: tuple[LegSpec, ...] = (
-    LegSpec(
-        instance="v1",
-        heartbeat=REPO_ROOT / "data" / "heartbeat",
-        alert_tag="snapback-btc",
-    ),
+    # v1 muted 2026-11-04 (paused + unfunded, unit down) — same reason as
+    # cnh_short below. Re-add when v1 is refunded and resumed.
+    # LegSpec(
+    #     instance="v1",
+    #     heartbeat=REPO_ROOT / "data" / "heartbeat",
+    #     alert_tag="snapback-btc",
+    # ),
     LegSpec(
         instance="donchian",
         heartbeat=REPO_ROOT / "data" / "heartbeat_donchian",

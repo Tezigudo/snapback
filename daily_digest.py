@@ -50,7 +50,8 @@ log = logging.getLogger("snapback.daily_digest")
 # 2026-07-02) and had never heard of sol_supertrend (real money since
 # 2026-07-27), so the daily mail described a book that no longer existed.
 LEGS = [
-    {"name": "v1",             "log": "bot.jsonl",            "state": "state.db",                "heartbeat": "heartbeat",                "live": True},
+    # v1 muted 2026-11-04 with monitor.LEGS (paused + unfunded, unit down).
+    # {"name": "v1",             "log": "bot.jsonl",            "state": "state.db",                "heartbeat": "heartbeat",                "live": True},
     {"name": "donchian",       "log": "donchian.jsonl",       "state": "state_donchian.db",       "heartbeat": "heartbeat_donchian",       "live": True},   # real money since 2026-07-02
     {"name": "sol_supertrend", "log": "sol_supertrend.jsonl", "state": "state_sol_supertrend.db", "heartbeat": "heartbeat_sol_supertrend", "live": True},   # real money since 2026-07-27
 ]
