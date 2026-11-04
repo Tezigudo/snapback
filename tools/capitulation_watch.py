@@ -161,8 +161,10 @@ def _load_coin(coin: str, *, backfill: bool) -> pd.DataFrame | None:
     if df is None or df.empty or len(df) < GAIN_WINDOW + ATR_PERIOD + 5:
         log.warning("%s: insufficient data (%s rows)", coin, 0 if df is None else len(df))
         return None
-    # Drop the last bar: it may be the still-forming current hour.
-    return df.iloc[:-1]
+    # Keep closed bars only. Dropped by timestamp, not blindly the last row:
+    # load_klines returns the forming bar only when it fetched one.
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(TIMEFRAME)
+    return df[df.index <= cutoff]
 
 
 def scan(*, backfill: bool = False) -> list[dict]:

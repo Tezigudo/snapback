@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -158,6 +159,34 @@ def fetch_funding(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
     return df.set_index("funding_time")[["funding_rate"]].sort_index()
 
 
+def _closed_only(df: pd.DataFrame, timeframe: Timeframe, as_of: datetime) -> pd.DataFrame:
+    """Drop bars that had not closed at fetch time, before caching them.
+
+    Binance returns the still-forming bar as the last row. Caching that row
+    froze it: the next forward fetch starts after `cached_end`, so the partial
+    bar was never re-fetched. Found 2026-11-04 on the droplet: the BTC 4h cache
+    was wrong on most bars since 2026-06-02 (closes off by up to ~$4k, volume a
+    fraction of real) and the 1h cache since 2026-05-17, because their readers
+    refresh more often than a bar closes. Callers still get the forming row in
+    the returned frame; it is only kept out of the cache.
+
+    `as_of` must be taken BEFORE the fetch: a bar that was forming when the
+    request started but closed while it ran is still a partial snapshot.
+    """
+    if df.empty:
+        return df
+    cutoff = pd.Timestamp(as_of) - pd.Timedelta(milliseconds=TF_MS[timeframe])
+    return df[df.index <= cutoff]
+
+
+def _write_cache(df: pd.DataFrame, path: Path) -> None:
+    """Write to a temp file and rename, so a crash mid-write can't leave a
+    truncated parquet that makes every later read_parquet fail."""
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_parquet(tmp)
+    os.replace(tmp, path)
+
+
 def load_klines(
     symbol: str = "BTC/USDT:USDT",
     timeframe: Timeframe = "15m",
@@ -171,21 +200,23 @@ def load_klines(
     a first call with small days_back would pin the cache start; later calls
     with larger days_back would silently return short slices.
     """
-    end = end or datetime.now(UTC)
+    as_of = datetime.now(UTC)  # before any fetch; see _closed_only
+    end = end or as_of
     start = end - timedelta(days=days_back)
     cache_path = _cache_path(symbol, timeframe)
+    tf = timedelta(milliseconds=TF_MS[timeframe])
 
     if not cache_path.exists():
         fresh = fetch_klines(symbol, timeframe, start, end)
         if not fresh.empty:
-            fresh.to_parquet(cache_path)
+            _write_cache(_closed_only(fresh, timeframe, as_of), cache_path)
         return fresh
 
     cached = pd.read_parquet(cache_path)
     if cached.empty:
         fresh = fetch_klines(symbol, timeframe, start, end)
         if not fresh.empty:
-            fresh.to_parquet(cache_path)
+            _write_cache(_closed_only(fresh, timeframe, as_of), cache_path)
         return fresh
 
     cached_start = cached.index.min().to_pydatetime()
@@ -200,8 +231,10 @@ def load_klines(
             chunks.insert(0, back)
             changed = True
 
-    # Extend forwards if the cache hasn't reached the requested end.
-    if end > cached_end + timedelta(hours=1):
+    # Extend forwards if the cache hasn't reached the requested end. The cache
+    # holds closed bars only, so anything past one bar after cached_end can be
+    # newer data (a flat 1h slack left sub-hour timeframes up to 45 min stale).
+    if end > cached_end + tf:
         fwd = fetch_klines(symbol, timeframe, cached_end + timedelta(milliseconds=1), end)
         if not fwd.empty:
             chunks.append(fwd)
@@ -210,7 +243,7 @@ def load_klines(
     if changed:
         combined = pd.concat(chunks).sort_index()
         combined = combined[~combined.index.duplicated(keep="last")]
-        combined.to_parquet(cache_path)
+        _write_cache(_closed_only(combined, timeframe, as_of), cache_path)
     else:
         combined = cached
 
