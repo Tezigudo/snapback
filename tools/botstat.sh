@@ -24,19 +24,18 @@ DROPLET="${SNAPBACK_DROPLET:-snapback-droplet}"
 # missing entirely, so the one tool used to eyeball the book at a glance was
 # blind to a funded leg. monitor.py and daily_digest.py were corrected on
 # 2026-08-05; this file was missed in that pass.
-LEGS_NAMES=(v1 donchian sol_supertrend)
+# v1 muted 2026-11-04 (paused + unfunded, unit down) along with monitor.LEGS.
+# Re-add v1 first in all four arrays when it is refunded and resumed.
+LEGS_NAMES=(donchian sol_supertrend)
 LEGS_HB=(
-  /root/snapback-btc/data/heartbeat
   /root/snapback-btc/data/heartbeat_donchian
   /root/snapback-btc/data/heartbeat_sol_supertrend
 )
 LEGS_DB=(
-  /root/snapback-btc/data/state.db
   /root/snapback-btc/data/state_donchian.db
   /root/snapback-btc/data/state_sol_supertrend.db
 )
 LEGS_LOG=(
-  /root/snapback-btc/logs/bot.jsonl
   /root/snapback-btc/logs/donchian.jsonl
   /root/snapback-btc/logs/sol_supertrend.jsonl
 )
