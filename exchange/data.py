@@ -158,6 +158,23 @@ def fetch_funding(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
     return df.set_index("funding_time")[["funding_rate"]].sort_index()
 
 
+def _closed_only(df: pd.DataFrame, timeframe: Timeframe) -> pd.DataFrame:
+    """Drop bars that had not closed at fetch time, before caching them.
+
+    Binance returns the still-forming bar as the last row. Caching that row
+    froze it: the next forward fetch starts after `cached_end`, so the partial
+    bar was never re-fetched. Found 2026-11-04 on the droplet: the BTC 4h cache
+    was wrong on most bars since 2026-06-02 (closes off by up to ~$4k, volume a
+    fraction of real) and the 1h cache since 2026-05-17, because their readers
+    refresh more often than a bar closes. Callers still get the forming row in
+    the returned frame; it is only kept out of the cache.
+    """
+    if df.empty:
+        return df
+    cutoff = pd.Timestamp(datetime.now(UTC)) - pd.Timedelta(milliseconds=TF_MS[timeframe])
+    return df[df.index <= cutoff]
+
+
 def load_klines(
     symbol: str = "BTC/USDT:USDT",
     timeframe: Timeframe = "15m",
@@ -178,14 +195,14 @@ def load_klines(
     if not cache_path.exists():
         fresh = fetch_klines(symbol, timeframe, start, end)
         if not fresh.empty:
-            fresh.to_parquet(cache_path)
+            _closed_only(fresh, timeframe).to_parquet(cache_path)
         return fresh
 
     cached = pd.read_parquet(cache_path)
     if cached.empty:
         fresh = fetch_klines(symbol, timeframe, start, end)
         if not fresh.empty:
-            fresh.to_parquet(cache_path)
+            _closed_only(fresh, timeframe).to_parquet(cache_path)
         return fresh
 
     cached_start = cached.index.min().to_pydatetime()
@@ -210,7 +227,7 @@ def load_klines(
     if changed:
         combined = pd.concat(chunks).sort_index()
         combined = combined[~combined.index.duplicated(keep="last")]
-        combined.to_parquet(cache_path)
+        _closed_only(combined, timeframe).to_parquet(cache_path)
     else:
         combined = cached
 
