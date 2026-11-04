@@ -102,7 +102,10 @@ DEFAULTS: dict[str, Any] = {
 }
 
 LEGS: list[dict[str, str]] = [
-    {"name": "v1",         "heartbeat": "heartbeat",            "log": "bot.jsonl",        "state": "state.db",            "systemd": "snapback-btc",                   "live": True},
+    # v1 muted 2026-11-04: paused since 2026-10-27, funds moved out 2026-11-04,
+    # kill switch fired on the withdrawal and the unit is down. Re-add this row
+    # (and the watchdog LegSpec) in the same change that refunds and resumes v1.
+    # {"name": "v1",         "heartbeat": "heartbeat",            "log": "bot.jsonl",        "state": "state.db",            "systemd": "snapback-btc",                   "live": True},
     {"name": "donchian",   "heartbeat": "heartbeat_donchian",   "log": "donchian.jsonl",   "state": "state_donchian.db",   "systemd": "snapback-btc-donchian",          "live": True},   # real-money since 2026-07-02
     {"name": "sol_supertrend", "heartbeat": "heartbeat_sol_supertrend", "log": "sol_supertrend.jsonl", "state": "state_sol_supertrend.db", "systemd": "snapback-sol-supertrend", "live": True},  # real-money since 2026-07-27 (God's go)
     # cnh_short retired 2026-07-12 (archive/cnh_short_retired_20260712). Its
