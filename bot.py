@@ -5039,8 +5039,25 @@ class Bot:
                                      else "flattening and exiting")
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
-                        # raises → stops kept, alert sent, loop retries next tick
-                        _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
+                        # H2 (round 4): a RAISING close (network, -2022, -1021)
+                        # is handled HERE, not by the outer handlers, so the
+                        # risk-reducing hooks and the URGENT timer run on that
+                        # path too. Stops stay (close-first), alert already sent.
+                        try:
+                            _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
+                        except Exception as e:
+                            self.log.error("HALT: close raised (%s) — not exiting; "
+                                           "retrying", e)
+                            if isinstance(e, ccxt.InvalidNonce):
+                                try:
+                                    self.client.ex.load_time_difference()
+                                except Exception as sync_err:
+                                    self.log.warning("load_time_difference() failed: %s",
+                                                     sync_err)
+                            self._halt_retry_tick(which)
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
                         if halt_flat and _o is None:
                             self._exit_found_flat("HALT")   # G3
                         if not halt_flat:
