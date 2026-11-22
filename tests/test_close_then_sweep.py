@@ -741,3 +741,30 @@ def test_client_close_from_account_amt_is_reduce_only_and_signed():
     assert args[2] == "buy" and args[3] == 0.01
     assert ex.create_order.call_args.args[-1]["reduceOnly"] is True \
         if len(args) > 5 else ex.create_order.call_args.kwargs["params"]["reduceOnly"]
+
+
+def test_strict_confirm_sits_between_the_close_and_the_sweep():
+    # sourcery 4657591048
+    b, mc = _bot()
+    parent = MagicMock()
+    parent.attach_mock(mc.close_position, "close_position")
+    parent.attach_mock(mc.fetch_position_checked, "fetch_position_checked")
+    parent.attach_mock(mc.cancel_open_orders, "cancel_open_orders")
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("flat", 0.0, 0.0)
+    with patch("bot.send_alert"):
+        b._close_then_sweep("r1", "x", "time-stop")
+    names = [c[0] for c in parent.mock_calls]
+    assert names == ["close_position", "fetch_position_checked", "cancel_open_orders"]
+
+
+def test_lenient_flat_with_unknown_strict_read_sweeps_nothing():
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position.return_value = _open("flat", 0.0, 0.0)       # lenient: flat
+    mc.fetch_position_checked.side_effect = PositionUnknown("garbled")
+    with patch("bot.send_alert"):
+        order, flat = b._close_then_sweep("r1", "x", "time-stop")
+    assert flat is False
+    mc.cancel_open_orders.assert_not_called()
