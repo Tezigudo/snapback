@@ -62,7 +62,7 @@ class TestC5Identity:
         assert _flattened(mc)
         # The flatten still tags the close with the newest entry root.
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
         assert bot._last_position_side == "unknown"
 
     def test_bracket_without_signal_id_flattens(self):
@@ -247,6 +247,11 @@ def _boot_reads(*positions):
     mc.fetch_equity_usdt.return_value = 1000.0
     mc.close_position.return_value = None      # close_position no-ops when flat
     mc.fetch_position.side_effect = list(positions)
+    # strict confirmation reads (2026-11) see the exchange's CURRENT state:
+    # the last position in the script
+    last = positions[-1]
+    mc.fetch_position_checked.side_effect = last if isinstance(last, BaseException) else None
+    mc.fetch_position_checked.return_value = last
     from tests.test_boot_resume import _boot_patches, _principal_patches
     with _boot_patches(), _principal_patches():
         bot.boot()
@@ -272,7 +277,7 @@ class TestC6ReRead:
         bot, mc = _boot_reads(_open(), _flat_pos())
         assert "boot_adopt" not in _outbox_kinds()
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
         # close_position returned None (already flat): no fabricated $0 exit,
         # the surviving sibling is swept instead (see TestAlreadyFlatAtFlatten).
         assert "boot_flatten" not in _outbox_kinds()
@@ -514,7 +519,7 @@ class TestHaltAndKillAfterAdopt:
         _bot, mc, rc = _adopt_then_loop(tmp_path, halt_by="self")
         assert rc == 0
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="h")
+            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="h", sweep_first=False)
         assert "halt" in _outbox_kinds()
 
     def test_t10_kill_switch_after_adopt_closes_on_the_first_tick(self, tmp_path):
@@ -523,7 +528,7 @@ class TestHaltAndKillAfterAdopt:
                                        principal_p=1000.0)
         assert rc == 0
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="k")
+            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="k", sweep_first=False)
         assert bot.halt_path.exists()
         assert "kill_switch" in _outbox_kinds()
 
@@ -684,8 +689,11 @@ class TestAlreadyFlatAtFlatten:
         post-close equity read), boot_flatten emitted, no extra sweep."""
         _bot, mc = _observe_boot({"id": "1", "average": 65100.0})
         names = [c[0] for c in mc.mock_calls if not c[0].startswith("ex.market")]
-        assert names[-3:] == ["fetch_position", "close_position", "fetch_equity_usdt"]
-        mc.cancel_open_orders.assert_not_called()
+        # 2026-11: close FIRST, confirm flat (strict read), THEN sweep — the
+        # sweep used to live inside close_position, before the close
+        assert names[-5:] == ["fetch_position", "close_position", "fetch_position_checked",
+                              "cancel_open_orders", "fetch_equity_usdt"]
+        mc.cancel_open_orders.assert_called_once()
         assert "boot_flatten" in _outbox_kinds()
         assert _events("boot_flatten_already_flat") == []
 

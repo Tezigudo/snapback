@@ -114,7 +114,7 @@ def test_flag_off_flattens_an_adoptable_position_exactly_as_before(params):
     bot, mc, meta_keys = _boot(params)
 
     mc.close_position.assert_called_once_with(
-        "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+        "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
     kinds = _outbox_kinds()
     assert "boot_flatten" in kinds and "boot_adopt" not in kinds
     # None of Phase B's state is touched on the boot path.
@@ -158,7 +158,7 @@ def test_malformed_boot_resume_config_still_flattens(bad):
     _seed_adoptable()
     _bot, mc, meta_keys = _boot({**_MINIMAL_PARAMS, "boot_resume": bad})
     mc.close_position.assert_called_once_with(
-        "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+        "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
     assert "boot_adopt_log" not in meta_keys
 
 
@@ -200,7 +200,7 @@ def test_interlock_forces_flatten_when_config_says_armed(caplog):
         bot.boot()
 
     mc.close_position.assert_called_once_with(
-        "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+        "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
     assert "boot_adopt" not in _outbox_kinds()
     assert [c for c in alert.call_args_list
             if c.args and "arming interlock" in c.args[0]]
@@ -267,8 +267,35 @@ _FLATTEN_SHA256_WITH_ALREADY_FLAT = (
     "a6c5f67681f2e699c31fe884657b371b3b5674bef0359f6650385c05abe6ce2f")
 
 
+# 2026-11 safety batch: the DELIBERATE edits to the flatten block, as
+# (text now in bot.py, text it replaced). Reverting exactly these must give
+# back the pinned pre-2026-11 block, so any OTHER change still fails here.
+#   - close FIRST, sweep AFTER (_close_then_sweep; was close_position's
+#     sweep-then-close default);
+#   - the already-flat branch sweeps only on a CONFIRMED flat.
+_2026_11_EDITS = (
+    ('                close_order, bf_flat = self._close_then_sweep(root, "bf", "boot-flatten")\n',
+     '                close_order = self.client.close_position(\n'
+     '                    self.symbol, client_order_id_root=root, close_leg="bf")\n'),
+    ('                if close_order is None:\n'
+     '                    if bf_flat:\n'
+     '                        self._boot_close_found_flat(pos, root)\n'
+     '                    # else: not confirmed flat — nothing swept, already alerted\n'
+     '                    # by _close_then_sweep; the tick loop owns the position.\n'
+     '                    return\n',
+     _ALREADY_FLAT_INSERT),
+)
+
+
+def _revert_2026_11(block: str) -> str:
+    for new, old in _2026_11_EDITS:
+        assert block.count(new) == 1, f"2026-11 edit not found verbatim: {new[:60]!r}"
+        block = block.replace(new, old)
+    return block
+
+
 def test_flatten_block_is_byte_identical_to_droplet_baseline():
-    block = _flatten_block((REPO / "bot.py").read_text())
+    block = _revert_2026_11(_flatten_block((REPO / "bot.py").read_text()))
     assert hashlib.sha256(block.encode()).hexdigest() == _FLATTEN_SHA256_WITH_ALREADY_FLAT
     assert block.count(_ALREADY_FLAT_INSERT) == 1
     stripped = block.replace(_ALREADY_FLAT_INSERT, "")
