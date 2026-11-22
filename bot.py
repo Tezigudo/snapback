@@ -1769,18 +1769,41 @@ class Bot:
         # would stack or flip the open position. Confirm flat strictly (with
         # the independent account endpoint behind an empty positionRisk)
         # before anything is cancelled or sent.
+        #
+        # A skip here CONSUMES the bar: _last_signal_ts was advanced and
+        # persisted above, before evaluation, so this signal is NOT retried on
+        # a later tick of the same bar (same as every other entry skip). The
+        # next bar is evaluated afresh.
         flat, seen = self._strict_flat_reads()
         if not flat:
+            n = getattr(self, "_entry_skip_unconfirmed_n", 0) + 1
+            self._entry_skip_unconfirmed_n = n
             self.log.warning("entry %s sid=%s SKIPPED: flat not confirmed by a "
-                             "strict read (%s) — nothing cancelled, nothing sent",
-                             decision.side, signal_id, seen)
+                             "strict read (%s) — nothing cancelled, nothing sent "
+                             "(%d in a row; bar consumed)",
+                             decision.side, signal_id, seen, n)
             try:
                 state.record_event("WARN", "entry_skipped_flat_unconfirmed",
-                                   {"side": decision.side, "seen": seen},
+                                   {"side": decision.side, "seen": seen, "streak": n},
                                    signal_id=signal_id)
             except Exception:
                 self.log.exception("entry-skip bookkeeping failed")
+            if n >= self.ENTRY_SKIP_ESCALATE_AFTER:
+                # G4: a leg that keeps refusing entries on an unconfirmable
+                # flat is not trading. ERROR (the monitor mails it) plus our
+                # own alert, at most once per ENTRY_SKIP_ALERT_S.
+                self.log.error("entry blocked: %d signals in a row skipped because "
+                               "flat could not be confirmed (%s)", n, seen)
+                now = time.time()
+                if now - getattr(self, "_entry_skip_alert_ts", 0.0) >= self.ENTRY_SKIP_ALERT_S:
+                    self._entry_skip_alert_ts = now
+                    send_alert(f"{self.instance}: entries blocked — flat unconfirmable",
+                               f"{n} entry signals in a row were skipped because a "
+                               f"strict position read could not confirm the leg is "
+                               f"flat (last: {seen}). Each skip consumes its bar. "
+                               f"Check Binance and the position endpoints.")
             return
+        self._entry_skip_unconfirmed_n = 0
         try:
             self._place_live_entry(decision, qty, signal_id, equity)
         except Exception as e:
@@ -3355,6 +3378,8 @@ class Bot:
     BRACKET_SITE = "bracket_exit"
 
     TP_PLACED_KEY = "tp_placed_root"
+    ENTRY_SKIP_ESCALATE_AFTER = 3     # G4: consecutive F1 skips before ERROR + alert
+    ENTRY_SKIP_ALERT_S = 3600.0
 
     def _tp_was_placed(self) -> bool:
         """Was a TP recorded as placed for the position being tracked? Fails
