@@ -428,7 +428,7 @@ class TestMaybeChannelExit:
              patch("bot.send_alert") as alert:
             bot._maybe_channel_exit(equity=12345.0)
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="1700000000000", close_leg="ce")
+            "BTC/USDT:USDT", client_order_id_root="1700000000000", close_leg="ce", sweep_first=False)
         assert rec.call_args.kwargs["reason"] == "channel_exit"
         assert rec.call_args.kwargs["side"] == "close"
         assert enq.call_args.kwargs["payload"]["reason"] == "channel_exit"

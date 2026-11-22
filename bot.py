@@ -690,10 +690,12 @@ class Bot:
                 self.log.warning("Boot found open position %s qty=%.4f @ %.2f. "
                                  "Flattening (root=%s).",
                                  pos.side, pos.qty, pos.entry_price, root or "—")
-                close_order = self.client.close_position(
-                    self.symbol, client_order_id_root=root, close_leg="bf")
+                close_order, bf_flat = self._close_then_sweep(root, "bf", "boot-flatten")
                 if close_order is None:
-                    self._boot_close_found_flat(pos, root)
+                    if bf_flat:
+                        self._boot_close_found_flat(pos, root)
+                    # else: not confirmed flat — nothing swept, already alerted
+                    # by _close_then_sweep; the tick loop owns the position.
                     return
                 # Emit the REAL flatten fill + post-close equity so the dashboard
                 # attributes the actual PnL. Previously this sent the ENTRY price
@@ -4017,8 +4019,7 @@ class Bot:
                         (int(now) // self.bar_seconds) * self.bar_seconds - 1)
                 else:
                     self._note_held(now)
-                order = self.client.close_position(
-                    self.symbol, client_order_id_root=root, close_leg="x")
+                order, _flat = self._close_then_sweep(root, "x", "time-stop")
                 exit_price = self._resolve_fill_price(order)
                 _entry = self._open_entry_fill()
                 state.record_fill(side="close", qty=pos.qty,
@@ -4059,9 +4060,9 @@ class Bot:
 
         Structurally mirrors _maybe_time_stop: fetch position, evaluate, and on
         a trigger close reduce-only (COID-tagged, close_leg='ce'), record the
-        fill, enqueue the exit event, alert. The surviving bracket sibling is
-        swept by close_position's own COID-scoped cancel_open_orders before the
-        reduce-only close is placed.
+        fill, enqueue the exit event, alert. The leg's SL/TP stay resting until
+        the close is confirmed flat, then are swept (_close_then_sweep; before
+        2026-11 they were cancelled BEFORE the close was sent).
 
         Bars are fetched on self.entry_tf, so each leg is evaluated on the
         timeframe its own rule is defined on (4h for donchian/supertrend, 15m
@@ -4099,8 +4100,7 @@ class Bot:
             # A bot close on this tick consumes the bar it was decided on, so
             # _maybe_enter can't re-enter on that same bar later in the tick.
             self._note_held(time.time())
-            order = self.client.close_position(
-                self.symbol, client_order_id_root=root, close_leg="ce")
+            order, _flat = self._close_then_sweep(root, "ce", "trend-exit")
             exit_price = self._resolve_fill_price(order)
             _entry = self._open_entry_fill()
             state.record_fill(side="close", qty=pos.qty,
@@ -4344,6 +4344,108 @@ class Bot:
             return False
         return mark <= be_price if side == "long" else mark >= be_price
 
+    # --- bot-initiated close: close FIRST, sweep AFTER (2026-11 review) ------
+    CLOSE_CONFIRM_READS = 2
+    CLOSE_CONFIRM_SLEEP_S = 0.5
+    CLOSE_FAIL_ALERT_S = 600.0
+
+    def _close_then_sweep(self, root: str | None, close_leg: str,
+                          why: str) -> tuple[dict | None, bool]:
+        """Every bot-initiated close goes through here. Returns
+        (order, flat_confirmed); `order` is None when close_position found the
+        position already flat (nothing sent, NOTHING swept — the flat edge in
+        _detect_bracket_exit confirms and sweeps that case).
+
+        Order of operations, and why:
+          1. the reduce-only market close, with the leg's SL/TP STILL RESTING
+             (sweep_first=False). close_position's old default cancelled them
+             first, so a rejected close (margin, -2022, -1021, timeout) left a
+             leveraged position with no stop and no TP, and no alert.
+          2. confirm flat with a strict re-read (fetch_position_checked; up to
+             CLOSE_CONFIRM_READS reads CLOSE_CONFIRM_SLEEP_S apart).
+          3. only then sweep the leg's orders (coid-prefix scoped).
+
+        Double-close: impossible to overshoot — the close and every bracket leg
+        are reduce-only, so whichever fills second is cancelled/rejected by the
+        exchange rather than opening the other side. A retry after a close
+        that raised but actually filled finds the position flat and sends
+        nothing (close_position re-reads first).
+
+        If the close RAISES: the stops stay, an alert is mailed (rate-limited
+        per close_leg, so a HALT retried every tick does not spam), and the
+        exception propagates — the caller's existing handling (retry next tick)
+        is unchanged. If the close is sent but flat is NOT confirmed: nothing is
+        swept and an alert is mailed.
+        """
+        try:
+            order = self.client.close_position(
+                self.symbol, client_order_id_root=root, close_leg=close_leg,
+                sweep_first=False)
+        except Exception as e:
+            self._alert_close_failed(close_leg, why,
+                                     f"the reduce-only close RAISED: {e!r}. The "
+                                     f"stop and TP were NOT cancelled and are "
+                                     f"still resting. The bot retries on its "
+                                     f"next pass; check Binance.")
+            raise
+        flat, last = self._strict_flat_reads()
+        if order is None:
+            # close_position sent NOTHING because its own lenient read said
+            # flat — the same single read N1 is about. Sweep nothing here;
+            # report whether a strict re-read agrees.
+            if not flat:
+                self._alert_close_failed(close_leg, why,
+                                         f"close_position read the position as "
+                                         f"flat and sent no order, but a strict "
+                                         f"re-read does not confirm it ({last}). "
+                                         f"Nothing was cancelled. Check Binance.")
+            return None, flat
+        if not flat:
+            self._alert_close_failed(close_leg, why,
+                                     f"the close order was sent but the "
+                                     f"position is NOT confirmed flat ({last}). "
+                                     f"The stop and TP were NOT cancelled. "
+                                     f"Check Binance.")
+            return order, False
+        try:
+            self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
+        except Exception:
+            # Leftover reduce-only legs are harmless on a flat position;
+            # _detect_bracket_exit / boot / the pre-entry sweep remove them.
+            self.log.exception("%s close: post-close sweep failed", why)
+        return order, True
+
+    def _strict_flat_reads(self) -> tuple[bool, str]:
+        """(confirmed_flat, last_observation) from up to CLOSE_CONFIRM_READS
+        strict reads. An unreadable payload is never flat."""
+        last = "unread"
+        for i in range(self.CLOSE_CONFIRM_READS):
+            if i:
+                time.sleep(self.CLOSE_CONFIRM_SLEEP_S)
+            try:
+                p = self.client.fetch_position_checked(self.symbol)
+                if p.side == "flat":
+                    return True, "flat"
+                last = f"{p.side} qty={p.qty} still open"
+            except Exception as e:   # never raise: the close may already be sent
+                last = f"read failed: {e}"
+        return False, last
+
+    def _alert_close_failed(self, close_leg: str, why: str, detail: str) -> None:
+        self.log.error("BOT CLOSE FAILED (%s, leg=%s): %s", why, close_leg, detail)
+        now = time.time()
+        sent = getattr(self, "_close_fail_alert_ts", None)
+        if sent is None:
+            sent = self._close_fail_alert_ts = {}
+        if now - sent.get(close_leg, 0.0) < self.CLOSE_FAIL_ALERT_S:
+            return
+        sent[close_leg] = now
+        try:
+            send_alert(f"{self.instance}: bot {why} close FAILED",
+                       f"{why} close of {self.symbol} ({self.instance}): {detail}")
+        except Exception:
+            self.log.exception("close-failed alert could not be sent")
+
     def _breakeven_close(self, pos, root: str, be_price: float, mfe: float,
                          equity: float) -> None:
         """Price is already back through breakeven: close at market — the
@@ -4364,14 +4466,7 @@ class Bot:
         # stop and no TP, and a retry that finds price back above breakeven
         # would restore only the -sb stop — the TP lost for good.)
         self._note_held(time.time())
-        order = self.client.close_position(self.symbol, client_order_id_root=root,
-                                           close_leg="be", sweep_first=False)
-        try:
-            self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
-        except Exception:
-            # Leftover reduce-only brackets are harmless on a flat position,
-            # and _detect_bracket_exit / the pre-entry sweep remove them.
-            self.log.exception("breakeven close: post-close sweep failed")
+        order, _flat = self._close_then_sweep(root, "be", "breakeven")
         if order is None:
             # Already flat by the time close_position looked (e.g. a manual
             # close in between). Write NOTHING: a bogus `close` row here would
@@ -4413,11 +4508,11 @@ class Bot:
                     self.log.warning("HALT flag present [%s] — %s.", which,
                                      "exiting (DRY-RUN, no flatten)" if self.dry_run
                                      else "flattening and exiting")
+                    halt_flat = True
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
-                        self.client.close_position(
-                            self.symbol,
-                            client_order_id_root=root, close_leg="h")
+                        # raises → stops kept, alert sent, loop retries next tick
+                        _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
                     state.enqueue_bot_event(
                         "halt",
                         payload={"dry_run": bool(self.dry_run),
@@ -4429,7 +4524,7 @@ class Bot:
                         self.log.warning("halt push failed: %s", e)
                     send_alert("Bot HALTED",
                                f"{which} detected. "
-                               f"{'DRY-RUN exit, no flatten.' if self.dry_run else 'Position flattened.'} "
+                               f"{'DRY-RUN exit, no flatten.' if self.dry_run else ('Position flattened.' if halt_flat else 'Close sent but flat NOT confirmed — stops left resting, CHECK BINANCE.')} "
                                f"Bot exiting.")
                     return 0
 
@@ -4467,9 +4562,9 @@ class Bot:
                 if equity_known and self._check_kill_switch(equity):
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
-                        self.client.close_position(
-                            self.symbol,
-                            client_order_id_root=root, close_leg="k")
+                        # raises → stops kept, alert sent, loop retries (the
+                        # kill switch wrote HALT, so the HALT path re-closes)
+                        self._close_then_sweep(root, "k", "kill-switch")
                     return 0
 
                 # #49 no-stop hooks are risk-REDUCING (close / protect a naked

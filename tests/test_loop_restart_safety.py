@@ -20,6 +20,9 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+
+from tests._flat_confirm import agree_on_flat  # noqa: E402
 
 import ccxt
 import pytest
@@ -186,7 +189,9 @@ def mkbot(inst="v1"):
     b = object.__new__(bot_mod.Bot)
     b.log = logging.getLogger("t"); b._stopped = False; b.poll_s = 0.0
     b.symbol = "BTC/USDT:USDT"; b.instance = inst; b.dry_run = False
-    b.client = MagicMock(); b.client.fetch_equity_usdt.return_value = 100.0
+    b.coid_prefix = "snap-v1-"
+    b.client = agree_on_flat(MagicMock()); b.client.fetch_equity_usdt.return_value = 100.0
+    b.client.fetch_position.return_value = SimpleNamespace(side="long", qty=0.01)
     b._heartbeat = lambda: None
     for n in ("_maybe_reconcile_principal","_detect_bracket_exit","_maybe_time_stop",
               "_maybe_channel_exit","_maybe_breakeven","_maybe_reprotect",
@@ -229,6 +234,8 @@ def test_loop_halt_close_failure_is_retried_not_swallowed():
     def cp(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1: raise ccxt.ExchangeError("boom")
+        b.client.fetch_position.return_value = SimpleNamespace(side="flat", qty=0.0)
+        return {"id": "close-2"}
     b.client.close_position.side_effect = cp
     order = []
     with patch.object(bot_mod, "halt_source", return_value="self"), \
@@ -238,10 +245,12 @@ def test_loop_halt_close_failure_is_retried_not_swallowed():
          patch.object(bot_mod.time, "sleep", side_effect=lambda s: order.append(("sleep", calls["n"]))):
         assert b.loop() == 0
     assert calls["n"] == 2
-    # the failed attempt backs off once and sends NO alert; the single alert
-    # only comes after the second (successful) close
-    assert order == [("sleep", 1), ("alert", 2)]
-    al.assert_called_once()
+    # 2026-11: the failed attempt now ALERTS (stops kept, "close FAILED"),
+    # backs off once, and the "Bot HALTED" mail follows the successful close
+    assert order == [("alert", 1), ("sleep", 1), ("alert", 2)]
+    assert "close FAILED" in al.call_args_list[0].args[0]
+    assert al.call_args_list[1].args[0] == "Bot HALTED"
+    b.client.cancel_open_orders.assert_called_once()   # swept only after the close
 
 def test_loop_generic_error_backs_off_doubling_cap_300_and_continues():
     b = mkbot(); b.poll_s = 100.0
