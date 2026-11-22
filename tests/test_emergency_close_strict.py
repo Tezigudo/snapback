@@ -69,6 +69,9 @@ def test_unconfirmed_close_keeps_the_stop():
     from exchange.binance_client import PositionUnknown
     c.fetch_position_checked = lambda symbol: (_ for _ in ()).throw(PositionUnknown("down"))
     with patch("exchange.binance_client.time.sleep"):
-        closed, order, _e = c.emergency_close(SYMBOL, ROOT, "long", 0.005)
-    assert closed and order is not None        # the close WAS sent
+        closed, order, err = c.emergency_close(SYMBOL, ROOT, "long", 0.005)
+    # H5 (round 4): the close WAS sent, but flat is unconfirmed -> NOT closed,
+    # so _finish_no_stop keeps the pending record and active_bracket
+    assert not closed and order is not None and err is not None
     assert [r["clientAlgoId"] for r in ex.algo] == [f"snap-d3-{ROOT}-s"]
+    assert len(ex.closes()) == 1               # no second close from here
