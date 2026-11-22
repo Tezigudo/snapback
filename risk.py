@@ -162,6 +162,34 @@ def check_notional(notional_usd: float) -> None:
         )
 
 
+def clamp_qty_to_notional_cap(qty: float, price: float,
+                              qty_step: float) -> tuple[float, bool]:
+    """Shrink `qty` so qty * price <= MAX_NOTIONAL_USD. Returns (qty, clamped).
+
+    2026-11 (God approved): an over-cap signal is RESIZED to the cap instead of
+    skipped. The caller keeps the stop and TP PRICES, so only the quantity
+    shrinks and the realised risk is LOWER than the target — never higher.
+    Never increases qty (min with the input). The cap value itself is
+    untouched. Floor-rounded to `qty_step`; the caller still applies the
+    exchange minimums and skips if the clamped size falls below them, and
+    check_notional() stays as the backstop.
+    """
+    c = ceilings()
+    cap = float(c.MAX_NOTIONAL_USD)
+    if not (price > 0) or qty * price <= cap:
+        return qty, False
+    raw = cap / price
+    if qty_step and qty_step > 0:
+        n = int(raw / qty_step + 1e-9)
+        q = n * qty_step
+        while n > 0 and q * price > cap:     # float guard: never above the cap
+            n -= 1
+            q = n * qty_step
+    else:
+        q = raw
+    return max(min(q, qty), 0.0), True
+
+
 def check_leverage(requested: int) -> None:
     c = ceilings()
     if requested > c.MAX_LEVERAGE:
