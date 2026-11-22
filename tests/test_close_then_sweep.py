@@ -149,18 +149,49 @@ def test_halt_close_failure_does_not_claim_flattened_and_keeps_looping():
     assert rv == 0 and b._stopped  # loop exited only via the patched sleep (retry path)
 
 
-def test_halt_close_unconfirmed_says_so():
+def test_halt_close_unconfirmed_does_not_exit_until_confirmed():
+    """F5: an unconfirmed HALT close keeps the process alive and retries; it
+    exits 0 (and mails "Bot HALTED") only once flat is confirmed."""
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    reads = {"n": 0}
+
+    def _checked(*a, **k):
+        reads["n"] += 1
+        # tick 1 (2 confirm reads): still open; tick 2: flat
+        return _open("long", 65_000.0, 0.01) if reads["n"] <= 2 else \
+            __import__("tests.test_orphan_bracket_cleanup", fromlist=["_flat"])._flat()
+    mc.fetch_position_checked.side_effect = _checked
+    sleeps = []
+    with patch("bot.halt_source", return_value="self"), \
+         patch("bot.send_alert") as alert, patch("bot.consolidate_push"), \
+         patch("bot.time.sleep", side_effect=sleeps.append):
+        assert b.loop() == 0
+    assert mc.close_position.call_count == 2
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert subjects.count("Bot HALTED") == 1 and subjects[-1] == "Bot HALTED"
+    assert mc.cancel_open_orders.call_count == 1          # swept only once confirmed
+
+
+def test_kill_close_unconfirmed_does_not_exit():
     b, mc = _bot()
     mc.close_position.side_effect = None
     mc.close_position.return_value = {"id": "1"}
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
-    with patch("bot.halt_source", return_value="self"), \
-         patch("bot.send_alert") as alert, patch("bot.consolidate_push"):
-        assert _loop_once(b) == 0
-    halted = [c.args[1] for c in alert.call_args_list if c.args[0] == "Bot HALTED"]
-    assert halted and "NOT confirmed" in halted[0]
+    b._kill_switch_after_reconcile = lambda equity: True
+    mc.fetch_equity_usdt.return_value = 10.0
+    def _sleep(_s):
+        if mc.close_position.call_count >= 2:
+            b._stopped = True
+    with patch("bot.halt_source", return_value=None), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        rv = b.loop()
+    assert mc.close_position.call_count >= 2               # retried, not exited
     mc.cancel_open_orders.assert_not_called()
+    assert rv == 0 and b._stopped                          # left only via the test stop
 
 
 def test_kill_switch_close_failure_alerts_and_keeps_stops():
@@ -251,7 +282,7 @@ def test_time_stop_books_nothing_unless_flat_confirmed(case):
 
 
 def test_time_stop_confirmed_close_still_books():
-    b, mc = _time_stop_bot()
+    b, _mc = _time_stop_bot()
     with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
         b._maybe_time_stop(equity=1000.0)
     assert _reasons() == ["entry", "time_stop"]
