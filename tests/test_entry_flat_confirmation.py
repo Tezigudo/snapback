@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from exchange.binance_client import PositionUnknown
-from tests.test_notional_cap_resize import _bot, _decision, _enter  # noqa: F401
+from tests.test_notional_cap_resize import _bot, _decision, _enter
 from tests.test_orphan_bracket_cleanup import _open
 
 
