@@ -142,3 +142,53 @@ def test_no_breach_is_untouched(P):
     assert b._kill_switch_after_reconcile(290.0) is False
     assert P.reconciles == 0
     b._check_kill_switch.assert_called_once_with(290.0)
+
+
+# --- F7: entries blocked during the grace; loop()-level grace -> kill ---------
+
+def test_entries_blocked_while_the_kill_grace_is_active(P):
+    from tests._bot_seed import seed_no_stop_state
+    b = _bot(wallet_now=150.0)
+    seed_no_stop_state(b, bot_mod.Bot)
+    b._pending_record = lambda: None
+    b._meta_record_ex = lambda key, kind: (None, True)
+    b._unverified_record_ex = lambda: (None, True)
+    b._latch_active = lambda: False
+    assert b._entry_blocked() is False
+    assert b._kill_switch_after_reconcile(150.0) is False      # grace opens
+    assert b._entry_blocked() is True
+    b._kill_grace = None
+    assert b._entry_blocked() is False
+
+
+def test_loop_withdrawal_grace_defers_then_kills_on_a_real_breach(P):
+    """Drive loop(): tick 1 = 150 USDT withdrawn (unbooked) -> deferred, the
+    leg keeps running with entries blocked; tick 2 = price drawdown that
+    breaches on its own -> kill switch fires, 'k' close, loop returns 0."""
+    from tests.test_loop_restart_safety import mkbot
+    b = mkbot("donchian")
+    b.kill_fraction = KF
+    b._kill_grace = None
+    b._last_principal_reconcile_ts = 0.0
+    b._last_position_side, b._last_position_qty = "long", 0.01
+    b._prev_tick_fingerprint = ("long", 0.01, 7)
+    b._prev_tick_wallet, b._prev_tick_equity = 300.0, 300.0
+    b._persist_live_equity = MagicMock()          # keep _prev_tick_* as seeded
+    b.client.fetch_position.return_value = SimpleNamespace(side="long", qty=0.01)
+    seq = iter([(150.0, 150.0), (40.0, 150.0)])    # (equity, wallet) per tick
+
+    def _equity():
+        eq, w = next(seq)
+        b.client.last_wallet_usdt = w
+        return eq
+    b.client.fetch_equity_usdt.side_effect = _equity
+    entered = []
+    b._maybe_enter = MagicMock(side_effect=lambda eq: entered.append(b._kill_grace is not None))
+    b._check_kill_switch = MagicMock(
+        side_effect=lambda eq: principal_mod.breached(eq, principal_mod.get_principal(), KF))
+    with patch.object(bot_mod, "halt_source", return_value=None), \
+         patch.object(bot_mod.time, "sleep"):
+        assert b.loop() == 0
+    assert entered == [True]                       # tick 1 ran on, grace active
+    assert b.client.close_position.call_args.kwargs["close_leg"] == "k"
+    assert any("DEFERRED" in c.args[0] for c in P.alert.call_args_list)

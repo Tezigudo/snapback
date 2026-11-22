@@ -1971,6 +1971,10 @@ class Bot:
         # reduce-only legs live against the new position.
         if self._flat_pending(self.BRACKET_SITE):
             return True
+        # F7: a kill switch held for an unbooked withdrawal is a leg that may
+        # be about to be flattened and HALTed — open nothing new meanwhile.
+        if getattr(self, "_kill_grace", None) is not None:
+            return True
         if self._pending_record() is not None:
             return True
         if not self._pending_meta_stale and \
