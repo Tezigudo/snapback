@@ -502,3 +502,39 @@ def test_halt_close_raising_runs_risk_hooks_and_escalates():
     assert "no_stop" in calls and "reprotect" in calls and "enter" not in calls
     assert sum(1 for c in alert.call_args_list if c.args[0].startswith("URGENT")) == 1
     mc.cancel_open_orders.assert_not_called()
+
+
+# --- H3 (round 4): the no-stop close finish is None-equity safe --------------
+
+def test_finish_no_stop_with_unknown_equity_still_mails_records_then_clears():
+    import json as _json
+    import sqlite3
+    b, _mc = _bot()
+    rec = {"kind": "no_stop_close", "root": "r1", "side": "long", "qty": 0.01,
+           "entry_price": 65_000.0, "stop_price": None, "why": "t"}
+    b._no_stop_pending = rec
+    state.set_meta(b.NO_STOP_PENDING_KEY, _json.dumps(rec))
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    with patch("bot.send_alert") as alert:
+        b._finish_no_stop("long", 0.01, 65_000.0, "r1", None, closed=True,
+                          order={"id": "1", "average": 64_500.0}, close_error=None,
+                          why="HALT retry reprotect", record_if_flat=True)
+    (mail,) = [c for c in alert.call_args_list if c.args[0] == "NO STOP — position closed"]
+    assert "Equity: unknown" in mail.args[1]
+    assert b._pending_record() is None
+    with sqlite3.connect(state.DB_PATH) as c:
+        row = c.execute("SELECT reason, equity_after FROM fills ORDER BY id DESC LIMIT 1").fetchone()
+    assert row == ("no_stop_close", None)          # never a 0 / stale equity
+
+
+def test_halt_retry_marks_equity_stale_so_nothing_persists_it():
+    b, mc = _bot()
+    b._last_known_equity = 123.0
+    b._equity_stale = False
+    seen = []
+    b._maybe_finish_no_stop_close = lambda eq: seen.append(b._ledger_equity(eq))
+    b._maybe_reprotect = lambda eq: None
+    with patch("bot.send_alert"):
+        b._halt_retry_tick("self data/HALT_v1")
+    assert seen == [None]
