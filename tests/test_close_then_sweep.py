@@ -214,3 +214,86 @@ def test_boot_flatten_happy_path_closes_then_sweeps():
     names = [c[0] for c in parent.mock_calls]
     assert names[:2] == ["close_position", "cancel_open_orders"], names
     assert mc.fetch_position.return_value.side == "flat"
+
+
+# --- F2: time-stop / trend-exit book nothing unless flat is confirmed ---------
+
+def _time_stop_bot():
+    b, mc = _bot()
+    b.params = {**b.params, "strategy": {**(b.params.get("strategy") or {}),
+                                          "max_hold_bars": 1}}
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    return b, mc
+
+
+def _reasons():
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+
+
+@pytest.mark.parametrize("case", ["unconfirmed", "already_flat"])
+def test_time_stop_books_nothing_unless_flat_confirmed(case):
+    b, mc = _time_stop_bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"} if case == "unconfirmed" else None
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = (
+        _open("long", 65_000.0, 0.01) if case == "unconfirmed" else
+        __import__("tests.test_orphan_bracket_cleanup", fromlist=["_flat"])._flat())
+    with patch("bot.send_alert") as alert, patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    mc.close_position.assert_called_once()
+    assert _reasons() == ["entry"]                       # no close row, no price-0 row
+    assert not any("time-stop close" in c.args[0] and "FAILED" not in c.args[0]
+                   for c in alert.call_args_list)
+
+
+def test_time_stop_confirmed_close_still_books():
+    b, mc = _time_stop_bot()
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    assert _reasons() == ["entry", "time_stop"]
+
+
+def test_unconfirmed_time_stop_exit_is_recorded_later_by_the_flat_edge():
+    """The SL/close fill's PnL is not dropped: the fills row is still `entry`,
+    so the next flat edge prices the exit from the exchange's own trade."""
+    b, mc = _time_stop_bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    # next tick: the position IS flat now, bracket legs swept/filled
+    from tests.test_orphan_bracket_cleanup import _flat
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.send_alert"):
+        b._detect_bracket_exit(equity=990.0)
+    assert _reasons() == ["entry", "bracket_exit"]
+
+
+def test_trend_exit_books_nothing_when_unconfirmed():
+    b, mc = _bot()
+    b.strategy_name = "donchian-v3"
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    import pandas as pd
+    mc.fetch_ohlcv.return_value = pd.DataFrame({"Close": [1.0, 1.0]})
+    with patch("bot.trend_exit_signal", return_value=(True, {"reason": "x"})), \
+         patch("bot.send_alert"):
+        b._maybe_channel_exit(equity=1000.0)
+    mc.close_position.assert_called_once()
+    assert _reasons() == ["entry"]
