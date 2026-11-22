@@ -35,6 +35,7 @@ USAGE:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -721,9 +722,9 @@ class Bot:
                 # deriveLegStats then counts as a loss).
                 # Refetch: the create response carries avgPrice "0.00", so the
                 # old `or pos.entry_price` fallback always fired and made every
-                # boot-flatten report PnL of exactly 0.
-                close_price = (self._resolve_fill_price(close_order)
-                               or pos.entry_price)
+                # boot-flatten report PnL of exactly 0. sourcery 4657591036: an
+                # unresolved price stays UNKNOWN (None) — never the entry price.
+                close_price = self._resolve_fill_price(close_order)
                 try:
                     equity_after = float(self.client.fetch_equity_usdt())
                 except Exception:
@@ -742,10 +743,10 @@ class Bot:
                     signal_id=root,
                     side=pos.side,
                     qty=float(pos.qty),
-                    price_usd=float(close_price),
+                    price_usd=float(close_price) if close_price else None,
                     equity_usd=equity_after,
                     payload={"reason": "stale_position_at_boot",
-                             "exit_price": float(close_price),
+                             "exit_price": float(close_price) if close_price else None,
                              "entry_price": float(pos.entry_price),
                              "pnl_usd": pnl_usd},
                 )
@@ -794,7 +795,7 @@ class Bot:
                 f"Leg: {self.instance} ({self.symbol})\n"
                 f"Side: {pos.side}  Size: {pos.qty:.6f} {self.base_asset}\n"
                 f"Entry: {pos.entry_price:,.4f}  Close: "
-                f"{(close_price or 0.0):,.4f}  PnL: "
+                f"{(f'{close_price:,.4f}' if close_price else 'unknown')}  PnL: "
                 + (f"${pnl_usd:+,.2f}" if pnl_usd is not None else "unknown")
                 + f"\nReason: restart found an open position; not resumed "
                 f"({reason}).\n"
@@ -1097,8 +1098,12 @@ class Bot:
             P2 = principal.get_principal()
             # a withdrawal booked by THIS reconcile is already in P2: do not
             # count the same wallet drop again as "unbooked" (sourcery 4657581919)
-            booked = (float(P) - float(P2)
-                      if isinstance(P, (int, float)) and isinstance(P2, (int, float))
+            # sourcery 4657581919: ... and nor one booked by the hourly reconcile at
+            # the top of THIS tick: measure from the principal at tick start.
+            P0 = getattr(self, "_tick_start_principal", None)
+            base = P0 if isinstance(P0, (int, float)) else P
+            booked = (float(base) - float(P2)
+                      if isinstance(base, (int, float)) and isinstance(P2, (int, float))
                       else 0.0)
             if principal.breached(equity, P2, self.kill_fraction) and \
                     self._withdrawal_grace(equity, P2, booked):
@@ -2333,12 +2338,25 @@ class Bot:
                        + f"Equity: {_fmt_usd(equity)}\nsignal_id: {root or '(untagged)'}")
         except Exception:
             self.log.exception("no-stop: closed-mail failed")
-        # sourcery 4657581356: the root sweep inside the close cancels `-e` without
-        # proving it. If it is not proven gone, hand it to the unverified-entry
-        # guard (after_emergency_close: no false "filled outside the ledger"
-        # mail, entries stay blocked until the order is proven gone).
-        if root and self._unverified_record() is None \
-                and self.client.cancel_entry_order(self.symbol, str(root)) is not True:
+        self._watch_emergency_entry(root, side, entry_price, stop_price)
+        self._clear_pending()
+        self._set_meta_quietly("active_bracket", "")
+
+    def _watch_emergency_entry(self, root: str | None, side: str,
+                               entry_price: float | None,
+                               stop_price: float | None) -> None:
+        """sourcery 4657588356: an episode that ends an emergency / no-stop close
+        (any path) must not leave the root's `-e` entry order unwatched: the root
+        sweep inside the close cancels it without proving it. If it is not proven
+        gone, hand it to the unverified-entry guard (after_emergency_close: no
+        false "filled outside the ledger" mail, entries blocked until proven
+        gone). Runs AFTER the close/flat decision, so it never delays a close.
+        Never raises."""
+        try:
+            if not root or self._unverified_record() is not None:
+                return
+            if self.client.cancel_entry_order(self.symbol, str(root)) is True:
+                return
             self._set_unverified({
                 "kind": "entry_unverified", "root": str(root), "side": side,
                 "after_emergency_close": True, "since": time.time(),
@@ -2347,8 +2365,43 @@ class Bot:
                 "tp_distance": 0.0, "place_tp": False, "error": "emergency close"})
             self.log.warning("no-stop: entry %s not proven gone after the emergency "
                              "close — guarded", root)
-        self._clear_pending()
-        self._set_meta_quietly("active_bracket", "")
+        except Exception:
+            self.log.exception("no-stop: guarding the entry order failed")
+
+    def _resolve_unverified_after_close(self, u: dict, root: str) -> None:
+        """The guard just finished protecting / emergency-closing a late fill.
+        Clear the record only when the entry order is PROVEN gone; otherwise keep
+        it (marked after_emergency_close so a later flat does not mail a false
+        "closed outside the ledger")."""
+        if self.client.cancel_entry_order(self.symbol, root) is True:
+            self._clear_unverified()
+            return
+        u["after_emergency_close"] = True
+        self._set_unverified(u)
+        self.log.warning("unverified entry %s: closed/protected but the entry order "
+                         "is not proven gone — record kept", root)
+
+    UNVERIFIED_ESCALATE_S = 1800.0
+
+    def _escalate_stuck_unverified(self, u: dict, root: str, why: str) -> None:
+        """A record that cannot be resolved silently blocks entries: after
+        UNVERIFIED_ESCALATE_S say so once at ERROR (one mail)."""
+        if u.get("escalated"):
+            return
+        if "stuck_since" not in u:
+            u["stuck_since"] = time.time()
+            self._set_unverified(u)
+        first = float(u["stuck_since"])
+        if time.time() - first < self.UNVERIFIED_ESCALATE_S:
+            return
+        u["escalated"] = True
+        self._set_unverified(u)
+        self.log.error("unverified entry %s unresolved for %.0f min (%s) — entries "
+                       "stay BLOCKED", root, (time.time() - first) / 60, why)
+        send_alert("Entries BLOCKED — entry order cannot be verified",
+                   f"Entry {root}: {why} for over {self.UNVERIFIED_ESCALATE_S / 60:.0f} "
+                   f"min, so entries stay blocked. Check the entry order and the "
+                   f"position on Binance; the bot keeps checking.")
 
     def _emergency_close(self, pos, root: str | None, equity: float, why: str,
                          stop_price: float | None = None,
@@ -2397,6 +2450,10 @@ class Bot:
             if not self._confirm_flat("no_stop_retry", stop_evidence=False):
                 self._no_stop_next_try = now  # re-check next tick, no backoff
                 return
+            # 4657588356: the `-e` entry order must be proven gone (or watched)
+            # before this episode is forgotten
+            self._watch_emergency_entry(root, side, p.get("entry_price"),
+                                        p.get("stop_price"))
             self._clear_pending()
             if self._newest_fill_is_entry_of(root):
                 try:
@@ -2446,6 +2503,8 @@ class Bot:
                                  root, filled)
                 qty = float(pos.qty)
         if pos.side != side or abs(pos.qty - qty) > tol or newer_entry:
+            self._watch_emergency_entry(root, side, p.get("entry_price"),
+                                        p.get("stop_price"))
             self._clear_pending()
             self.log.error("no-stop retry ABANDONED: open %s %.4f (latest root %s) is "
                            "not the pending %s %.4f (root %s) — NOT touched",
@@ -2469,7 +2528,7 @@ class Bot:
             coid_root=str(int(time.time() * 1000)))
         if not closed:
             self._finish_no_stop(side, qty, p.get("entry_price"), root, equity,
-                                 closed=False, order=None, close_error=err,
+                                 closed=False, order=order, close_error=err,
                                  why=str(p.get("why") or "pending no-stop close"),
                                  record_if_flat=False, stop_price=p.get("stop_price"))
             return
@@ -2692,12 +2751,15 @@ class Bot:
                                  "(%s) — record kept, entries stay blocked", root, seen)
                 return
             if self.client.cancel_entry_order(self.symbol, root) is not True:
+                self._escalate_stuck_unverified(u, root, "the entry order cannot be "
+                                                "proven gone")
                 return
             filled = self.client.entry_order_filled(self.symbol, root)
             tol = max(float(self.constraints.qty_step or 0.0) / 2, 1e-12)
             if filled is None:
                 self.log.warning("unverified entry %s: flat confirmed but the order's "
                                  "filled qty is unreadable — record kept", root)
+                self._escalate_stuck_unverified(u, root, "its filled qty is unreadable")
                 return
             # H1 (round 4) + sourcery 4657588376: the GTC limit can fill BETWEEN
             # the strict read above and the cancel, and the order-status read can
@@ -2765,7 +2827,7 @@ class Bot:
                     pos, root, float(u["sl_distance"]), float(u["tp_distance"]),
                     bool(u.get("place_tp", True)), equity,
                     why=f"entry raised ({u.get('error')})", record_if_flat=True):
-                self._clear_unverified()
+                self._resolve_unverified_after_close(u, root)
             return
         if pos.side != u.get("side"):
             self._clear_unverified()
@@ -2813,7 +2875,7 @@ class Bot:
                                             f"inside a larger {pos.qty:.4f} position"),
                                        record_if_flat=False, may_close=wholly_ours,
                                        entry_qty=filled):
-            self._clear_unverified()
+            self._resolve_unverified_after_close(u, root)
 
     def _clear_no_stop_records_at_boot(self) -> None:
         """boot() either flattened (sweeping our orders, incl. a resting `-e`)
@@ -3587,17 +3649,27 @@ class Bot:
         else:
             n = 1
         self._flat_seen[site] = (n, seq)
+        unknown = getattr(self, "_flat_unknown_n", None)
+        if unknown is None:
+            unknown = self._flat_unknown_n = {}
         try:
             second = self.client.fetch_position_checked(self.symbol)
         except Exception as e:
             # Never accepted as flat, however long it lasts. Past a few ticks
             # it is ERROR-level, so the monitor's ERROR alert mails it (entries
             # stay blocked while the bracket site is unconfirmed).
-            lvl = logging.ERROR if n >= self.FLAT_UNKNOWN_ERROR_TICKS else logging.WARNING
+            # sourcery 4657590277: an UNKNOWN tick is not a flat observation —
+            # reset the flat streak (flat, unknown, flat must not accept); the
+            # site stays pending.
+            self._flat_seen[site] = (0, seq)
+            unknown[site] = unknown.get(site, 0) + 1
+            lvl = (logging.ERROR if unknown[site] >= self.FLAT_UNKNOWN_ERROR_TICKS
+                   else logging.WARNING)
             self.log.log(lvl, "%s: flat read NOT confirmed — re-read failed (%s); "
                          "treating the position as UNKNOWN, nothing changed "
-                         "(%d consecutive)", site, e, n)
+                         "(%d consecutive)", site, e, unknown[site])
             return False
+        unknown.pop(site, None)
         if second.side != "flat" and second.qty > 0:
             self._flat_clear(site)
             self.log.warning("%s: single FLAT read contradicted by a re-read "
@@ -4936,6 +5008,7 @@ class Bot:
     CLOSE_CONFIRM_READS = 2
     CLOSE_CONFIRM_SLEEP_S = 0.5
     CLOSE_FAIL_ALERT_S = 600.0
+    CLOSE_FAIL_RETRY_S = 300.0   # min gap between mail attempts after a FAILED send
 
     def _close_then_sweep(self, root: str | None, close_leg: str,
                           why: str) -> tuple[dict | None, bool]:
@@ -5087,7 +5160,7 @@ class Bot:
         it is not; None = the ledger could not be read (`_open_entry_fill`
         swallows its own DB error, so probe the read directly)."""
         try:
-            with sqlite3.connect(state.DB_PATH) as c:
+            with contextlib.closing(sqlite3.connect(state.DB_PATH)) as c:
                 c.execute("SELECT 1 FROM fills LIMIT 1").fetchall()
         except Exception:
             return None
@@ -5100,15 +5173,22 @@ class Bot:
         the order's own fill price. Falls back to the exchange-trade detector
         when the price is unknown. NEVER raises: the position is already flat."""
         try:
-            side = getattr(self, "_last_position_side", "unknown")
-            qty = getattr(self, "_last_position_qty", None)
-            if order is None or side in ("flat", "unknown") or not qty:
+            if order is None:
                 return
+            # Side/qty come from the close order itself (fresh, from this pass):
+            # _last_position_* is stale in the HALT branch (it precedes the tick's
+            # position read) and "unknown" after a boot-time HALT.
+            side = {"sell": "long", "buy": "short"}.get(
+                str(order.get("side") or "").lower())
+            try:
+                qty = float(order.get("amount") or order.get("filled") or 0.0)
+            except (TypeError, ValueError):
+                qty = 0.0
             entry = self._open_entry_fill()
             if entry is None:
                 return   # newest row is not an open entry: nothing owed
             price = self._resolve_fill_price(order)
-            if not price:
+            if not price or side is None or qty <= 0:
                 self._detect_bracket_exit(float(equity) if equity is not None
                                           else float("nan"), flat_confirmed=True)
                 return
@@ -5193,6 +5273,15 @@ class Bot:
                 last = 0.0
         if now - last < self.CLOSE_FAIL_ALERT_S:
             return
+        # A FAILED send (SMTP down) must not be retried on every close pass:
+        # each attempt can block up to SMTP_TIMEOUT_S. Short retry throttle,
+        # in memory only; the long throttle above stays success-stamped.
+        tried = getattr(self, "_close_fail_try_ts", None)
+        if tried is None:
+            tried = self._close_fail_try_ts = {}
+        if now - tried.get(close_leg, 0.0) < self.CLOSE_FAIL_RETRY_S:
+            return
+        tried[close_leg] = now
         try:
             ok = send_alert(f"{self.instance}: bot {why} close FAILED",
                             f"{why} close of {self.symbol} ({self.instance}): {detail}")
@@ -5345,6 +5434,10 @@ class Bot:
                                f"Bot exiting.")
                     return 0
 
+                try:
+                    self._tick_start_principal = principal.get_principal()
+                except Exception:
+                    self._tick_start_principal = None
                 self._maybe_reconcile_principal()
                 equity_known = True
                 self._equity_stale = False

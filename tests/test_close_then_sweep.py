@@ -637,6 +637,37 @@ def test_halt_exits_once_the_entry_order_is_proven_gone_and_flat():
         assert b.loop() == 0
 
 
+def test_kill_switch_does_not_exit_while_the_entry_order_is_not_proven_gone():
+    b, mc = _unverified_halt_bot()
+    mc.cancel_entry_order.return_value = None          # cancel unconfirmed
+    b._kill_switch_after_reconcile = lambda equity: True
+    mc.fetch_equity_usdt.return_value = 10.0
+
+    def _sleep(_s):
+        if mc.close_position.call_count >= 3:
+            b._stopped = True
+    with patch("bot.halt_source", return_value=None), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        b.loop()
+    assert mc.close_position.call_count >= 3           # retried each pass, never exited
+    assert b._stopped is True                          # left only via the test stop
+
+
+def test_halt_close_raising_a_minus_1021_resyncs_the_clock():
+    # 4657588400: a -1021 that ccxt did not map to InvalidNonce (message only)
+    import ccxt
+    b, mc = _bot()
+    mc.close_position.side_effect = ccxt.ExchangeError(
+        'binanceusdm {"code":-1021,"msg":"Timestamp outside recvWindow"}')
+
+    def _sleep(_s):
+        b._stopped = True
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        b.loop()
+    mc.ex.load_time_difference.assert_called()
+
+
 # --- sourcery 4657592243 / 4657592261 / 4657591036: exit bookkeeping ----------
 
 def _seed_open_long(b):
@@ -663,8 +694,11 @@ def test_halt_found_flat_with_an_intact_bracket_still_books_the_exit():
     mc.fetch_position_checked.return_value = _flat()
     # bracket fully intact: the debounce alone would never book on this tick
     mc.fetch_algo_orders.side_effect = None
-    mc.fetch_algo_orders.return_value = ([{"clientAlgoId": "snap-v1-r1-s"},
-                                          {"clientAlgoId": "snap-v1-r1-t"}], True)
+    # reduceOnly: without it algo_bracket_leg returns None for these rows and
+    # the "intact" bracket would read as SL-gone fill evidence (4657592243)
+    mc.fetch_algo_orders.return_value = (
+        [{"clientAlgoId": "snap-v1-r1-s", "reduceOnly": True},
+         {"clientAlgoId": "snap-v1-r1-t", "reduceOnly": True}], True)
     mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
     with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
          patch("bot.consolidate_push"):
@@ -677,7 +711,8 @@ def test_halt_close_sent_and_confirmed_books_a_halt_close_row():
     b, mc = _bot()
     _seed_open_long(b)
     mc.close_position.side_effect = None
-    mc.close_position.return_value = {"id": "1", "average": 64_500.0}
+    mc.close_position.return_value = {"id": "1", "average": 64_500.0,
+                                      "side": "sell", "amount": 0.01}
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _flat()
     with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \

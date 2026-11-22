@@ -143,7 +143,7 @@ def test_flat_confirmed_retry_prices_the_close_from_the_persisted_order():
 
 
 def test_unproven_entry_cancel_after_emergency_close_rearms_the_guard():
-    # 4657581356 (NEEDS-GOD decision): close first, then guard `-e`
+    # 4657588356: close first, then guard `-e` (never block the close)
     b, mc = _make_bot()
     mc.cancel_entry_order.return_value = None
     with patch("bot.send_alert"):
@@ -191,7 +191,8 @@ def test_close_failed_throttle_is_set_only_after_a_successful_send():
     with patch("bot.send_alert", return_value=False) as alert:
         b._alert_close_failed("h", "HALT", "x")
         b._alert_close_failed("h", "HALT", "x")
-    assert alert.call_count == 2                       # failed send: not throttled
+    assert alert.call_count == 1       # failed send: short retry gap, not the long one
+    b._close_fail_try_ts.clear()        # ... which has elapsed
     with patch("bot.send_alert", return_value=True) as alert:
         b._alert_close_failed("h", "HALT", "x")
         b._alert_close_failed("h", "HALT", "x")

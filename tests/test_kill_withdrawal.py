@@ -116,11 +116,28 @@ def test_withdrawal_booked_this_tick_is_not_counted_again_as_unbooked(P):
     assert not any("DEFERRED" in c.args[0] for c in P.alert.call_args_list)
 
 
+def test_withdrawal_booked_by_the_hourly_reconcile_at_tick_start_is_not_counted_again(P):
+    """sourcery 4657581919 (round 1): the hourly reconcile at the top of the
+    tick already booked the 150 (P is 150 when the kill pre-check starts), so
+    the pre-check's own reconcile books nothing. The principal at TICK START
+    (300) is the baseline: residual = -150 + 150 = 0, equity 90 still breaches
+    -> kill, no DEFERRED."""
+    P.p = 150.0
+    P.ledger["sum"] = 150.0
+    b = _bot(wallet_now=150.0)
+    b._tick_start_principal = 300.0
+    assert b._kill_switch_after_reconcile(90.0) is True
+    assert not any("DEFERRED" in c.args[0] for c in P.alert.call_args_list)
+
+
 def test_unverified_position_read_during_grace_check_kills(P):
     """sourcery 4657581932: the grace uses the strict read; PositionUnknown
     means no deferral."""
     from exchange.binance_client import PositionUnknown
     b = _bot(wallet_now=150.0)
+    # the LENIENT read looks fine (same position): only the strict read can
+    # stop the deferral, so reverting to fetch_position fails this test
+    b.client.fetch_position.return_value = SimpleNamespace(side="long", qty=0.01)
     b.client.fetch_position_checked.side_effect = PositionUnknown("garbled")
     assert b._kill_switch_after_reconcile(150.0) is True
     assert b._kill_grace is None

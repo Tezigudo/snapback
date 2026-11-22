@@ -222,7 +222,8 @@ class TestPendingRetryDoesNotAbandonANakedPosition:
         n = len(ex.calls)
         with patch("bot.send_alert"):
             bot._maybe_finish_no_stop_close(150.0)
-        assert all(c[0] == "fetch_positions" for c in ex.calls[n:])
+        from tests.test_no_stop_fixpass import _only_reads_and_entry_cancel
+        assert _only_reads_and_entry_cancel(ex.calls[n:])
         assert ex.pos is not None
 
 

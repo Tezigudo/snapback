@@ -1467,7 +1467,13 @@ class BinanceClient:
         usable row (so close_position sent nothing) while the independent
         ACCOUNT endpoint shows a position. Send a REDUCE-ONLY market close sized
         from the signed account amount; reduce-only means a wrong side is
-        rejected, never opened. None = account flat or unreadable."""
+        rejected, never opened. None = account flat or unreadable.
+        One-way mode only: in hedge mode the order needs a positionSide and the
+        signed account amounts of two legs cannot be summed, so it REFUSES
+        (raises) rather than send a request that is rejected on every loop."""
+        if self.hedge_mode:
+            raise RuntimeError("close_from_account_amt: hedge mode is not supported "
+                               "(positionSide needed) — close the position manually")
         amt = self._account_position_amt(symbol, signed=True)
         if not amt:
             return None

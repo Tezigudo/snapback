@@ -292,6 +292,17 @@ _2026_11_EDITS = (
     ('                self._alert_boot_flatten(pos, root, close_price, pnl_usd,\n'
      '                                         verdict[1], bf_flat)\n',
      ''),
+    # sourcery 4657591036 (review round 1): an unresolved close price stays unknown
+    ('                # boot-flatten report PnL of exactly 0. sourcery 4657591036: an\n'
+     '                # unresolved price stays UNKNOWN (None) — never the entry price.\n'
+     '                close_price = self._resolve_fill_price(close_order)\n',
+     '                # boot-flatten report PnL of exactly 0.\n'
+     '                close_price = (self._resolve_fill_price(close_order)\n'
+     '                               or pos.entry_price)\n'),
+    ('                    price_usd=float(close_price) if close_price else None,\n',
+     '                    price_usd=float(close_price),\n'),
+    ('                             "exit_price": float(close_price) if close_price else None,\n',
+     '                             "exit_price": float(close_price),\n'),
 )
 
 
