@@ -645,7 +645,7 @@ class Bot:
                 self.log.warning("Boot found open position %s qty=%.4f @ %.2f. "
                                  "DRY-RUN: leaving it alone.",
                                  pos.side, pos.qty, pos.entry_price)
-            elif self._boot_resume_verdict(pos)[0]:
+            elif (verdict := self._boot_resume_verdict(pos))[0]:
                 # RESUME. The tick loop owns this position from here exactly as
                 # if no restart had happened: its age still reads from the fills
                 # table, the daily anchor still reads from state.meta, and the
@@ -714,6 +714,8 @@ class Bot:
                     equity_after = None
                 pnl_usd = _exit_pnl_usd(pos.side, pos.entry_price,
                                         close_price, pos.qty)
+                self._alert_boot_flatten(pos, root, close_price, pnl_usd,
+                                         verdict[1], bf_flat)
                 state.record_event("WARN", "boot_flatten",
                                    {"side": pos.side, "qty": pos.qty,
                                     "entry": pos.entry_price, "exit": close_price,
@@ -745,6 +747,30 @@ class Bot:
                 except Exception:
                     self.log.exception("boot: cancel_open_orders failed")
         self._clear_no_stop_records_at_boot()
+
+    def _alert_boot_flatten(self, pos, root: str | None, close_price: float | None,
+                            pnl_usd: float | None, reason: str, flat: bool) -> None:
+        """Mail every boot flatten (2026-11 review, N7): a restart closing a
+        live trade used to leave only a log line and a WARN event. Own try,
+        BEFORE the bookkeeping, so a sqlite failure cannot swallow it. NEVER
+        raises. Boot-resume is NOT armed by this; `reason` is its refusal."""
+        try:
+            send_alert(
+                f"{self.instance}: BOOT FLATTENED {pos.side.upper()} {pos.qty:.4f} "
+                f"{self.base_asset}",
+                f"Leg: {self.instance} ({self.symbol})\n"
+                f"Side: {pos.side}  Size: {pos.qty:.6f} {self.base_asset}\n"
+                f"Entry: {pos.entry_price:,.4f}  Close: "
+                f"{(close_price or 0.0):,.4f}  PnL: "
+                + (f"${pnl_usd:+,.2f}" if pnl_usd is not None else "unknown")
+                + f"\nReason: restart found an open position; not resumed "
+                f"({reason}).\n"
+                + ("Flat confirmed; leg orders swept." if flat else
+                   "Close sent but flat NOT confirmed — stops left resting. "
+                   "CHECK BINANCE.")
+                + f"\nsignal_id: {root or '(untagged)'}")
+        except Exception:
+            self.log.exception("boot-flatten alert failed")
 
     def _boot_close_found_flat(self, pos, root: str | None) -> None:
         """The boot flatten found the exchange ALREADY flat. NEVER raises.
