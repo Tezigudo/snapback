@@ -4663,7 +4663,9 @@ class Bot:
             return
         if not any(r.get("clientAlgoId") == sb_coid for r in rows):
             if self._breakeven_through(pos.side, be_price):
-                self._breakeven_close(pos, root, be_price, mfe, equity)
+                if not self._breakeven_close(pos, root, be_price, mfe, equity):
+                    self._breakeven_failed("breakeven close not confirmed flat", now)
+                    return
                 ab["be_moved"] = True
                 state.set_meta("active_bracket", json.dumps(ab))
                 self._be_evaluated_bar = last_closed
@@ -4678,7 +4680,9 @@ class Bot:
                 # not by matching an error string the algo endpoint may word
                 # differently.
                 if self._breakeven_through(pos.side, be_price):
-                    self._breakeven_close(pos, root, be_price, mfe, equity)
+                    if not self._breakeven_close(pos, root, be_price, mfe, equity):
+                        self._breakeven_failed("breakeven close not confirmed flat", now)
+                        return
                     ab["be_moved"] = True
                     state.set_meta("active_bracket", json.dumps(ab))
                     self._be_evaluated_bar = last_closed
@@ -4831,7 +4835,7 @@ class Bot:
             self.log.exception("close-failed alert could not be sent")
 
     def _breakeven_close(self, pos, root: str, be_price: float, mfe: float,
-                         equity: float) -> None:
+                         equity: float) -> bool:
         """Price is already back through breakeven: close at market — the
         backtest fills this case at the next bar's open. Mirrors
         _maybe_channel_exit's close + ledger path.
@@ -4850,7 +4854,15 @@ class Bot:
         # stop and no TP, and a retry that finds price back above breakeven
         # would restore only the -sb stop — the TP lost for good.)
         self._note_held(time.time())
-        order, _flat = self._close_then_sweep(root, "be", "breakeven")
+        order, flat = self._close_then_sweep(root, "be", "breakeven")
+        if not flat:
+            # G2 (round 3): close sent (or skipped) but flat NOT confirmed —
+            # book nothing (no breakeven_exit row, no "Closed" mail) and tell
+            # the caller NOT to set be_moved, so the step is retried. The
+            # close-failed alert already went out; the stops are still resting.
+            self.log.warning("Breakeven: close NOT confirmed flat — nothing "
+                             "recorded, breakeven not marked done")
+            return False
         if order is None:
             # Already flat by the time close_position looked (e.g. a manual
             # close in between). Write NOTHING: a bogus `close` row here would
@@ -4858,7 +4870,7 @@ class Bot:
             # and suppress its true price/PnL. It records the exit next tick.
             self.log.warning("Breakeven: position already flat at close time — "
                              "leaving the exit to _detect_bracket_exit")
-            return
+            return True
         exit_price = self._resolve_fill_price(order)
         _entry = self._open_entry_fill()
         state.record_fill(side="close", qty=pos.qty, price=float(exit_price or 0.0),
@@ -4876,6 +4888,7 @@ class Bot:
                    f"{be_price:,.4f}"
                    + (f" @ {exit_price:,.4f}" if exit_price else "")
                    + f". Equity: {equity:.2f}\nsignal_id: {root}")
+        return True
 
     def loop(self) -> int:
         self.log.info("Bot loop started. poll=%.1fs symbol=%s", self.poll_s, self.symbol)
