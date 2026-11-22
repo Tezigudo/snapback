@@ -476,3 +476,29 @@ def test_confirmed_time_stop_keeps_the_same_bar_stamp():
          patch("bot.time.time", return_value=now):
         b._maybe_time_stop(equity=1000.0)
     assert b._position_held_at == (int(now) // 3600) * 3600 - 1
+
+
+# --- H2 (round 4): a RAISING HALT close still runs the hooks + escalation ----
+
+def test_halt_close_raising_runs_risk_hooks_and_escalates():
+    b, mc = _bot()
+    mc.close_position.side_effect = RuntimeError("-2022 ReduceOnly rejected")
+    calls = []
+    b._maybe_finish_no_stop_close = lambda eq: calls.append("no_stop")
+    b._maybe_reprotect = lambda eq: calls.append("reprotect")
+    b._maybe_enter = lambda eq: calls.append("enter")
+    t = [1_000_000.0]
+    ticks = {"n": 0}
+
+    def _sleep(_s):
+        ticks["n"] += 1
+        t[0] += 300.0
+        if ticks["n"] >= 6:
+            b._stopped = True
+    with patch("bot.halt_source", return_value="self"), \
+         patch("bot.send_alert") as alert, patch("bot.time.sleep", side_effect=_sleep), \
+         patch("bot.time.time", side_effect=lambda: t[0]):
+        b.loop()
+    assert "no_stop" in calls and "reprotect" in calls and "enter" not in calls
+    assert sum(1 for c in alert.call_args_list if c.args[0].startswith("URGENT")) == 1
+    mc.cancel_open_orders.assert_not_called()
