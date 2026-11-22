@@ -94,6 +94,7 @@ def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
     """TP filled: the TP is gone from the algo book, the SL sibling rests.
     That IS the fill evidence — sweep and record on this tick (no latency)."""
     b, mc = _bot()
+    state.set_meta(b.TP_PLACED_KEY, ROOT)        # this position's TP was placed
     mc.fetch_position_checked.return_value = _flat()
     mc.fetch_algo_orders.return_value = ([SL], True)
     _tick(b)
@@ -103,8 +104,9 @@ def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
     assert not b._flat_pending(b.BRACKET_SITE)
 
 
-@pytest.mark.parametrize("book", [([SL, TP], True), ([], False)],
-                         ids=["bracket-intact", "algo-book-unreadable"])
+@pytest.mark.parametrize("book", [([SL, TP], True), ([], False), ([SL], True)],
+                         ids=["bracket-intact", "algo-book-unreadable",
+                              "tp-missing-but-never-recorded-placed"])
 def test_no_fill_evidence_defers_then_accepts_with_an_alert(book):
     b, mc = _bot()
     mc.fetch_position_checked.return_value = _flat()
@@ -122,6 +124,28 @@ def test_no_fill_evidence_defers_then_accepts_with_an_alert(book):
     assert not b._flat_pending(b.BRACKET_SITE)
 
 
+@pytest.mark.parametrize("recorded", ["", "1700000000000"], ids=["tp-failed", "other-root"])
+def test_missing_tp_is_not_fill_evidence_unless_this_positions_tp_was_placed(recorded):
+    """F6: TP placement failed ("stop is resting, position kept") or a stale
+    record for another root — a missing TP must not bypass the debounce."""
+    b, mc = _bot()
+    state.set_meta(b.TP_PLACED_KEY, recorded)
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL], True)
+    _tick(b)
+    _assert_untouched(b, mc)
+
+
+def test_record_tp_placed_at_entry():
+    b, _mc = _bot()
+    b._record_tp_placed({"sl": {}, "tp": {}}, "r9", place_tp=True)
+    assert state.get_meta(b.TP_PLACED_KEY) == "r9"
+    b._record_tp_placed({"sl": {}, "tp_error": "-2021"}, "r10", place_tp=True)
+    assert state.get_meta(b.TP_PLACED_KEY) == ""
+    b._record_tp_placed({"sl": {}}, "r11", place_tp=False)
+    assert state.get_meta(b.TP_PLACED_KEY) == ""
+
+
 def test_flat_then_open_resets_the_debounce():
     b, mc = _bot()
     mc.fetch_position_checked.return_value = _flat()
@@ -134,12 +158,40 @@ def test_flat_then_open_resets_the_debounce():
     _assert_untouched(b, mc)
 
 
-def test_retry_of_an_already_confirmed_exit_skips_confirmation():
+def test_retry_of_an_already_swept_exit_still_confirms_on_the_fast_path():
+    """A flat-edge retry (first pass swept, lookup failed) re-confirms: the
+    algo book is empty, so it records on the same tick."""
     b, mc = _bot()
-    b._exit_retry_n = 1  # the edge was confirmed and swept on an earlier tick
-    mc.fetch_position_checked.side_effect = AssertionError("must not re-confirm")
+    b._exit_retry_n = 1
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([], True)
     _tick(b)
     assert _fills() == ["entry", "bracket_exit"]
+    mc.fetch_position_checked.assert_called_once()
+
+
+def test_pending_replacement_retry_is_not_swept_on_a_false_flat():
+    """Replacement retry pending (_exit_retry_n=1, snapshot = OLD position) and
+    the REPLACEMENT position carries a fresh bracket. One false flat read must
+    not strip it, nor book a bracket_exit off the replacement's entry row."""
+    b, mc = _bot()
+    b._exit_retry_n = 1
+    mc.fetch_position_checked.return_value = _open("long", 66_000.0, QTY)
+    _tick(b)
+    mc.cancel_open_orders.assert_not_called()
+    assert _fills() == ["entry"]
+
+
+def test_persistently_unreadable_reread_escalates_to_error(caplog):
+    import logging
+    b, mc = _bot()
+    mc.fetch_position_checked.side_effect = PositionUnknown("no contracts")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(b.FLAT_UNKNOWN_ERROR_TICKS):
+            _tick(b)
+    assert any(r.levelno == logging.ERROR and "NOT confirmed" in r.getMessage()
+               for r in caplog.records)
+    _assert_untouched(b, mc)
 
 
 # --- no-stop retry site -------------------------------------------------------
@@ -176,9 +228,44 @@ def _client(payload):
     return BinanceClient(ex=ex, env="testnet", coid_prefix="snap-v1-")
 
 
-def test_checked_read_flat_on_empty_list():
-    # V3 positionRisk omits flat symbols: empty IS the normal flat answer
-    assert _client([]).fetch_position_checked("BTC/USDT:USDT").side == "flat"
+def _acct(ex, rows):
+    ex.fapiPrivateV2GetAccount.return_value = {"positions": rows}
+
+
+def test_empty_list_is_flat_only_if_the_account_endpoint_confirms():
+    # V3 positionRisk omits flat symbols; the INDEPENDENT account endpoint
+    # (fapi v2 account, lists every symbol) must say positionAmt == 0 (F8)
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0.000"},
+                 {"symbol": "ETHUSDT", "positionAmt": "1.0"}])
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+
+
+@pytest.mark.parametrize("acct", [
+    "raises", "no-method", "no-row", "nonzero", "garbage",
+], ids=lambda a: a)
+def test_empty_list_without_independent_confirmation_is_unknown(acct):
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    if acct == "raises":
+        c.ex.fapiPrivateV2GetAccount.side_effect = RuntimeError("timeout")
+    elif acct == "no-method":
+        del c.ex.fapiPrivateV2GetAccount
+    elif acct == "no-row":
+        _acct(c.ex, [{"symbol": "ETHUSDT", "positionAmt": "0"}])
+    elif acct == "nonzero":   # positionRisk stale-empty, account shows the position
+        _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0.010"}])
+    else:
+        _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "abc"}])
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+
+
+def test_explicit_zero_row_is_flat_without_the_account_read():
+    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+    c.ex.fapiPrivateV2GetAccount.assert_not_called()
 
 
 @pytest.mark.parametrize("payload", [

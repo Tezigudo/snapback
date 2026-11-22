@@ -694,11 +694,14 @@ class Bot:
                                  "Flattening (root=%s).",
                                  pos.side, pos.qty, pos.entry_price, root or "—")
                 close_order, bf_flat = self._close_then_sweep(root, "bf", "boot-flatten")
+                if not bf_flat:
+                    # Flat NOT confirmed (F3): nothing swept, no boot_flatten
+                    # event / PnL / "flattened" mail — _close_then_sweep already
+                    # sent the close-failed alert. The no-stop records are KEPT
+                    # (the position may be open); the tick loop owns it.
+                    return
                 if close_order is None:
-                    if bf_flat:
-                        self._boot_close_found_flat(pos, root)
-                    # else: not confirmed flat — nothing swept, already alerted
-                    # by _close_then_sweep; the tick loop owns the position.
+                    self._boot_close_found_flat(pos, root)   # clears the records itself
                     return
                 # Emit the REAL flatten fill + post-close equity so the dashboard
                 # attributes the actual PnL. Previously this sent the ENTRY price
@@ -740,6 +743,23 @@ class Bot:
             # orders left over from a prior run (e.g. a surviving bracket sibling
             # after an exchange-driven TP/SL fill).  Only our own COID prefix.
             if not self.dry_run:
+                # F3: ONE lenient read said flat. donchian / SOL have no
+                # reprotect, so sweeping a live position's SL here would leave
+                # it naked. Sweep only on a strictly confirmed flat.
+                flat_ok, seen = self._strict_flat_reads()
+                if not flat_ok:
+                    self.log.error("boot: position read flat but NOT confirmed by "
+                                   "a strict read (%s) — leg orders left alone, "
+                                   "no-stop records kept", seen)
+                    try:
+                        send_alert(f"{self.instance}: boot could not confirm flat",
+                                   f"boot() read {self.symbol} as flat, but a strict "
+                                   f"re-read does not confirm it ({seen}). Nothing "
+                                   f"was cancelled. The tick loop will track the "
+                                   f"position. Check Binance.")
+                    except Exception:
+                        self.log.exception("boot: unconfirmed-flat alert failed")
+                    return
                 try:
                     n = self.client.cancel_open_orders(
                         self.symbol, coid_prefix=self.coid_prefix)
@@ -1721,6 +1741,24 @@ class Bot:
             self.log.warning("entry %s sid=%s skipped: entries paused",
                              decision.side, signal_id)
             return
+        # F1 (2026-11 fix-pass): the gate above is ONE lenient read. A false
+        # flat there would reach _place_live_entry, whose pre-entry sweep
+        # cancels the leg's live SL/TP, and a second NON-reduce-only entry
+        # would stack or flip the open position. Confirm flat strictly (with
+        # the independent account endpoint behind an empty positionRisk)
+        # before anything is cancelled or sent.
+        flat, seen = self._strict_flat_reads()
+        if not flat:
+            self.log.warning("entry %s sid=%s SKIPPED: flat not confirmed by a "
+                             "strict read (%s) — nothing cancelled, nothing sent",
+                             decision.side, signal_id, seen)
+            try:
+                state.record_event("WARN", "entry_skipped_flat_unconfirmed",
+                                   {"side": decision.side, "seen": seen},
+                                   signal_id=signal_id)
+            except Exception:
+                self.log.exception("entry-skip bookkeeping failed")
+            return
         try:
             self._place_live_entry(decision, qty, signal_id, equity)
         except Exception as e:
@@ -1797,6 +1835,7 @@ class Bot:
                 orders=orders, dbg=decision.debug,
             )
             self._alert_tp_error(orders, decision.side, signal_id)
+            self._record_tp_placed(orders, signal_id, place_tp)
             self._note_protected_entry()
             return
 
@@ -1818,6 +1857,7 @@ class Bot:
             orders=orders, dbg=decision.debug,
         )
         self._alert_tp_error(orders, decision.side, signal_id)
+        self._record_tp_placed(orders, signal_id, place_tp)
         self._note_protected_entry()
 
     # --- no-stop handling (God's rule, 2026-10-13) ---------------------------
@@ -1930,6 +1970,10 @@ class Bot:
         # next tick — a path that deliberately never sweeps — leaving the old
         # reduce-only legs live against the new position.
         if self._flat_pending(self.BRACKET_SITE):
+            return True
+        # F7: a kill switch held for an unbooked withdrawal is a leg that may
+        # be about to be flattened and HALTed — open nothing new meanwhile.
+        if getattr(self, "_kill_grace", None) is not None:
             return True
         if self._pending_record() is not None:
             return True
@@ -3255,7 +3299,30 @@ class Bot:
     # so nothing would put the stop back. A flat that the bot is about to ACT
     # on must now be confirmed.
     FLAT_ACCEPT_TICKS = 2      # consecutive flat ticks that accept a flat with no fill evidence
+    FLAT_UNKNOWN_ERROR_TICKS = 5  # unreadable re-reads in a row before it logs ERROR
     BRACKET_SITE = "bracket_exit"
+
+    TP_PLACED_KEY = "tp_placed_root"
+
+    def _tp_was_placed(self) -> bool:
+        """Was a TP recorded as placed for the position being tracked? Fails
+        toward False (no fill evidence → the debounce decides)."""
+        root = getattr(self, "_last_entry_root", None)
+        if not root:
+            return False
+        try:
+            return state.get_meta(self.TP_PLACED_KEY) == str(root)
+        except Exception:
+            return False
+
+    def _record_tp_placed(self, orders: dict | None, signal_id: str,
+                          place_tp: bool) -> None:
+        """At entry: remember the root whose TP really rests (F6). Never raises."""
+        try:
+            ok = bool(place_tp) and not (orders or {}).get("tp_error")
+            state.set_meta(self.TP_PLACED_KEY, str(signal_id) if ok else "")
+        except Exception:
+            self.log.exception("tp-placed bookkeeping failed")
 
     def _flat_pending(self, site: str) -> bool:
         return self._flat_seen.get(site, 0) > 0
@@ -3292,9 +3359,13 @@ class Bot:
         try:
             second = self.client.fetch_position_checked(self.symbol)
         except Exception as e:
-            self.log.warning("%s: flat read NOT confirmed — re-read failed (%s); "
-                             "treating the position as UNKNOWN, nothing changed "
-                             "(%d/%d)", site, e, n, self.FLAT_ACCEPT_TICKS)
+            # Never accepted as flat, however long it lasts. Past a few ticks
+            # it is ERROR-level, so the monitor's ERROR alert mails it (entries
+            # stay blocked while the bracket site is unconfirmed).
+            lvl = logging.ERROR if n >= self.FLAT_UNKNOWN_ERROR_TICKS else logging.WARNING
+            self.log.log(lvl, "%s: flat read NOT confirmed — re-read failed (%s); "
+                         "treating the position as UNKNOWN, nothing changed "
+                         "(%d consecutive)", site, e, n)
             return False
         if second.side != "flat" and second.qty > 0:
             self._flat_clear(site)
@@ -3307,9 +3378,14 @@ class Bot:
             rows, ok = self.client.fetch_algo_orders(self.symbol)
             if ok:
                 legs = {algo_bracket_leg(r, self.coid_prefix) for r in rows}
+                # F6: only a leg the position is KNOWN to have had can count as
+                # "filled" by going missing. The SL always exists (no SL = the
+                # no-stop rule closed it). A missing TP is evidence only if
+                # this position's TP was recorded as PLACED: the TP can fail
+                # ("stop is resting, position kept") or be cancelled by hand,
+                # and must not then bypass the debounce.
                 intact = "sl" in legs and (
-                    "tp" in legs
-                    or strategy_uses_channel_exit(self.strategy_name))  # no TP placed
+                    "tp" in legs or not self._tp_was_placed())
             if intact is False:
                 self._flat_clear(site)
                 return True
@@ -3439,11 +3515,13 @@ class Bot:
             # "unknown" would make the next tick a silent "first observation"
             # and drop a real exit (the 2026-09-04 failure). It also must not
             # reset the _ext_pending debounce below. Not a retry either: it
-            # never touches _exit_retry_n. A retry of an exit that was already
-            # confirmed (_exit_retry_n > 0) has swept already and skips this.
+            # never touches _exit_retry_n. Retries are confirmed too — NO
+            # bypass: a pending REPLACEMENT retry restores the OLD snapshot
+            # while a fresh bracket protects the new position, so a false flat
+            # there must not sweep it. A genuine flat-edge retry confirms on the
+            # fast path anyway (its first pass swept, the algo book is empty).
             if current == "flat" and had_open:
-                if self._exit_retry_n == 0 and not self._confirm_flat(
-                        self.BRACKET_SITE, stop_evidence=True):
+                if not self._confirm_flat(self.BRACKET_SITE, stop_evidence=True):
                     return
             else:
                 self._flat_clear(self.BRACKET_SITE)
@@ -4222,7 +4300,20 @@ class Bot:
                         (int(now) // self.bar_seconds) * self.bar_seconds - 1)
                 else:
                     self._note_held(now)
-                order, _flat = self._close_then_sweep(root, "x", "time-stop")
+                order, flat = self._close_then_sweep(root, "x", "time-stop")
+                if order is None or not flat:
+                    # F2: book NOTHING. None = nothing was sent (already flat:
+                    # an SL/TP got there first); not flat = close-failed alert
+                    # already sent, the position may still be open. Either way
+                    # the fills row is still `entry`, so the next tick's flat
+                    # edge records the REAL exit from the exchange's trades
+                    # (with its true price/PnL); an open position re-fires the
+                    # time stop next tick.
+                    self.log.warning("time-stop: close %s — nothing recorded; "
+                                     "the flat edge records the real exit",
+                                     "found the position already flat" if order is None
+                                     else "NOT confirmed flat")
+                    return
                 exit_price = self._resolve_fill_price(order)
                 _entry = self._open_entry_fill()
                 state.record_fill(side="close", qty=pos.qty,
@@ -4303,7 +4394,14 @@ class Bot:
             # A bot close on this tick consumes the bar it was decided on, so
             # _maybe_enter can't re-enter on that same bar later in the tick.
             self._note_held(time.time())
-            order, _flat = self._close_then_sweep(root, "ce", "trend-exit")
+            order, flat = self._close_then_sweep(root, "ce", "trend-exit")
+            if order is None or not flat:
+                # F2: book nothing — see _maybe_time_stop.
+                self.log.warning("trend-exit: close %s — nothing recorded; "
+                                 "the flat edge records the real exit",
+                                 "found the position already flat" if order is None
+                                 else "NOT confirmed flat")
+                return
             exit_price = self._resolve_fill_price(order)
             _entry = self._open_entry_fill()
             state.record_fill(side="close", qty=pos.qty,
@@ -4711,11 +4809,26 @@ class Bot:
                     self.log.warning("HALT flag present [%s] — %s.", which,
                                      "exiting (DRY-RUN, no flatten)" if self.dry_run
                                      else "flattening and exiting")
-                    halt_flat = True
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries next tick
                         _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
+                        if not halt_flat:
+                            # F5: do NOT exit while flat is unconfirmed. The
+                            # units restart only on-failure, so `return 0` here
+                            # left the leg down holding an open position. Stay
+                            # alive: stops stay resting (nothing was swept), no
+                            # entry can run (this branch precedes everything
+                            # else in the tick), and the close is retried every
+                            # tick on a capped backoff; the close-failed alert
+                            # is rate-limited. Preferred over exiting non-zero,
+                            # which would restart into boot() and its flatten
+                            # path with the same unknown position, in a loop.
+                            self.log.error("HALT: flat NOT confirmed — not exiting; "
+                                           "retrying the close")
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
                     state.enqueue_bot_event(
                         "halt",
                         payload={"dry_run": bool(self.dry_run),
@@ -4727,7 +4840,7 @@ class Bot:
                         self.log.warning("halt push failed: %s", e)
                     send_alert("Bot HALTED",
                                f"{which} detected. "
-                               f"{'DRY-RUN exit, no flatten.' if self.dry_run else ('Position flattened.' if halt_flat else 'Close sent but flat NOT confirmed — stops left resting, CHECK BINANCE.')} "
+                               f"{'DRY-RUN exit, no flatten.' if self.dry_run else 'Position flattened (confirmed flat).'} "
                                f"Bot exiting.")
                     return 0
 
@@ -4767,7 +4880,16 @@ class Bot:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries (the
                         # kill switch wrote HALT, so the HALT path re-closes)
-                        self._close_then_sweep(root, "k", "kill-switch")
+                        _o, kill_flat = self._close_then_sweep(root, "k", "kill-switch")
+                        if not kill_flat:
+                            # F5: same as HALT — stay alive; HALT_<leg> now
+                            # exists, so the next tick's HALT branch retries
+                            # the close and exits only on a confirmed flat.
+                            self.log.error("kill switch: flat NOT confirmed — not "
+                                           "exiting; the HALT path retries the close")
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
                     return 0
 
                 # #49 no-stop hooks are risk-REDUCING (close / protect a naked

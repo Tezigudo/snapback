@@ -149,18 +149,49 @@ def test_halt_close_failure_does_not_claim_flattened_and_keeps_looping():
     assert rv == 0 and b._stopped  # loop exited only via the patched sleep (retry path)
 
 
-def test_halt_close_unconfirmed_says_so():
+def test_halt_close_unconfirmed_does_not_exit_until_confirmed():
+    """F5: an unconfirmed HALT close keeps the process alive and retries; it
+    exits 0 (and mails "Bot HALTED") only once flat is confirmed."""
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    reads = {"n": 0}
+
+    def _checked(*a, **k):
+        reads["n"] += 1
+        # tick 1 (2 confirm reads): still open; tick 2: flat
+        return _open("long", 65_000.0, 0.01) if reads["n"] <= 2 else \
+            __import__("tests.test_orphan_bracket_cleanup", fromlist=["_flat"])._flat()
+    mc.fetch_position_checked.side_effect = _checked
+    sleeps = []
+    with patch("bot.halt_source", return_value="self"), \
+         patch("bot.send_alert") as alert, patch("bot.consolidate_push"), \
+         patch("bot.time.sleep", side_effect=sleeps.append):
+        assert b.loop() == 0
+    assert mc.close_position.call_count == 2
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert subjects.count("Bot HALTED") == 1 and subjects[-1] == "Bot HALTED"
+    assert mc.cancel_open_orders.call_count == 1          # swept only once confirmed
+
+
+def test_kill_close_unconfirmed_does_not_exit():
     b, mc = _bot()
     mc.close_position.side_effect = None
     mc.close_position.return_value = {"id": "1"}
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
-    with patch("bot.halt_source", return_value="self"), \
-         patch("bot.send_alert") as alert, patch("bot.consolidate_push"):
-        assert _loop_once(b) == 0
-    halted = [c.args[1] for c in alert.call_args_list if c.args[0] == "Bot HALTED"]
-    assert halted and "NOT confirmed" in halted[0]
+    b._kill_switch_after_reconcile = lambda equity: True
+    mc.fetch_equity_usdt.return_value = 10.0
+    def _sleep(_s):
+        if mc.close_position.call_count >= 2:
+            b._stopped = True
+    with patch("bot.halt_source", return_value=None), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        rv = b.loop()
+    assert mc.close_position.call_count >= 2               # retried, not exited
     mc.cancel_open_orders.assert_not_called()
+    assert rv == 0 and b._stopped                          # left only via the test stop
 
 
 def test_kill_switch_close_failure_alerts_and_keeps_stops():
@@ -214,3 +245,86 @@ def test_boot_flatten_happy_path_closes_then_sweeps():
     names = [c[0] for c in parent.mock_calls]
     assert names[:2] == ["close_position", "cancel_open_orders"], names
     assert mc.fetch_position.return_value.side == "flat"
+
+
+# --- F2: time-stop / trend-exit book nothing unless flat is confirmed ---------
+
+def _time_stop_bot():
+    b, mc = _bot()
+    b.params = {**b.params, "strategy": {**(b.params.get("strategy") or {}),
+                                          "max_hold_bars": 1}}
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    return b, mc
+
+
+def _reasons():
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+
+
+@pytest.mark.parametrize("case", ["unconfirmed", "already_flat"])
+def test_time_stop_books_nothing_unless_flat_confirmed(case):
+    b, mc = _time_stop_bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"} if case == "unconfirmed" else None
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = (
+        _open("long", 65_000.0, 0.01) if case == "unconfirmed" else
+        __import__("tests.test_orphan_bracket_cleanup", fromlist=["_flat"])._flat())
+    with patch("bot.send_alert") as alert, patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    mc.close_position.assert_called_once()
+    assert _reasons() == ["entry"]                       # no close row, no price-0 row
+    assert not any("time-stop close" in c.args[0] and "FAILED" not in c.args[0]
+                   for c in alert.call_args_list)
+
+
+def test_time_stop_confirmed_close_still_books():
+    b, _mc = _time_stop_bot()
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    assert _reasons() == ["entry", "time_stop"]
+
+
+def test_unconfirmed_time_stop_exit_is_recorded_later_by_the_flat_edge():
+    """The SL/close fill's PnL is not dropped: the fills row is still `entry`,
+    so the next flat edge prices the exit from the exchange's own trade."""
+    b, mc = _time_stop_bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    # next tick: the position IS flat now, bracket legs swept/filled
+    from tests.test_orphan_bracket_cleanup import _flat
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.send_alert"):
+        b._detect_bracket_exit(equity=990.0)
+    assert _reasons() == ["entry", "bracket_exit"]
+
+
+def test_trend_exit_books_nothing_when_unconfirmed():
+    b, mc = _bot()
+    b.strategy_name = "donchian-v3"
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    import pandas as pd
+    mc.fetch_ohlcv.return_value = pd.DataFrame({"Close": [1.0, 1.0]})
+    with patch("bot.trend_exit_signal", return_value=(True, {"reason": "x"})), \
+         patch("bot.send_alert"):
+        b._maybe_channel_exit(equity=1000.0)
+    mc.close_position.assert_called_once()
+    assert _reasons() == ["entry"]

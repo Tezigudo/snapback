@@ -278,11 +278,14 @@ _2026_11_EDITS = (
     ('                close_order, bf_flat = self._close_then_sweep(root, "bf", "boot-flatten")\n',
      '                close_order = self.client.close_position(\n'
      '                    self.symbol, client_order_id_root=root, close_leg="bf")\n'),
-    ('                if close_order is None:\n'
-     '                    if bf_flat:\n'
-     '                        self._boot_close_found_flat(pos, root)\n'
-     '                    # else: not confirmed flat — nothing swept, already alerted\n'
-     '                    # by _close_then_sweep; the tick loop owns the position.\n'
+    ('                if not bf_flat:\n'
+     '                    # Flat NOT confirmed (F3): nothing swept, no boot_flatten\n'
+     '                    # event / PnL / "flattened" mail — _close_then_sweep already\n'
+     '                    # sent the close-failed alert. The no-stop records are KEPT\n'
+     '                    # (the position may be open); the tick loop owns it.\n'
+     '                    return\n'
+     '                if close_order is None:\n'
+     '                    self._boot_close_found_flat(pos, root)   # clears the records itself\n'
      '                    return\n',
      _ALREADY_FLAT_INSERT),
     # boot-flatten alert (item 5): an insertion, reverted to nothing

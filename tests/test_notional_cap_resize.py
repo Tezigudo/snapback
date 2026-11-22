@@ -18,6 +18,7 @@ import bot
 import risk
 from exchange.constraints import DEFAULT_CONSTRAINTS
 from tests._bot_seed import seed_no_stop_state
+from tests._flat_confirm import agree_on_flat
 
 CAP = 500.0
 PRICE = 65_000.0
@@ -65,7 +66,7 @@ def _bot(equity_risk_qty_price=PRICE, constraints=DEFAULT_CONSTRAINTS):
     b._last_signal_ts = None
     b._persist_last_signal_ts = MagicMock()
     b.log = logging.getLogger("test_notional_cap_resize")
-    b.client = MagicMock()
+    b.client = agree_on_flat(MagicMock())
     b.client.fetch_position.return_value = SimpleNamespace(side="flat")
     b._entry_blocked = lambda: False
     b._entries_paused = lambda: False

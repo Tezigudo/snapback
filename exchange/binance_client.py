@@ -339,19 +339,26 @@ class BinanceClient:
         flat-edge sweep used to strip a live position's stop on one such read
         (2026-11 review, N1). This raises `PositionUnknown` instead.
 
-        An EMPTY list is NOT unknown: ccxt's default positionRisk is the V3
-        endpoint, which omits symbols with no position and no open orders, so
-        an empty list is Binance's ordinary "flat". The bot's defence against a
-        stale-but-well-formed empty answer is the cross-tick debounce and the
-        resting-stop check in `Bot._confirm_flat`, not this method.
+        NO ROW for the symbol (an empty list included) is ambiguous: ccxt's
+        default positionRisk is the V3 endpoint, which omits symbols with no
+        position and no open orders, so it is Binance's ordinary "flat" — and
+        also exactly what a stale/empty payload looks like. A re-read of the
+        same endpoint milliseconds later is correlated with the first, so it
+        is confirmed through an INDEPENDENT endpoint (`_account_position_amt`,
+        the V2 account positions array, which lists every symbol including
+        zero ones). Zero there → flat; non-zero → PositionUnknown (the two
+        endpoints disagree); unreadable → PositionUnknown. An explicit row with
+        contracts == 0 is a positive "flat" from positionRisk itself.
         """
         positions = self.ex.fetch_positions([symbol])
         if not isinstance(positions, list):
             raise PositionUnknown(
                 f"fetch_positions returned {type(positions).__name__}, not a list")
+        seen_row = False
         for p in positions:
             if not isinstance(p, dict) or p.get("symbol") != symbol:
                 continue
+            seen_row = True
             raw = p.get("contracts")
             if raw is None:
                 raise PositionUnknown(f"{symbol} row has no 'contracts' field")
@@ -370,8 +377,49 @@ class BinanceClient:
                 unrealized_pnl=float(p.get("unrealizedPnl") or 0.0),
                 margin_used=float(p.get("initialMargin") or 0.0),
             )
+        if not seen_row:
+            amt = self._account_position_amt(symbol)
+            if amt is None:
+                raise PositionUnknown(
+                    f"positionRisk has no {symbol} row and the account endpoint "
+                    f"could not confirm flat")
+            if amt > 0:
+                raise PositionUnknown(
+                    f"positionRisk has no {symbol} row but the account endpoint "
+                    f"shows |positionAmt|={amt}")
         return Position(symbol=symbol, side="flat", qty=0.0,
                         entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
+
+    def _account_position_amt(self, symbol: str) -> float | None:
+        """Sum of |positionAmt| for `symbol` from GET /fapi/v2/account — an
+        endpoint independent of positionRisk. None when it cannot vouch: no
+        such ccxt method, the call fails, an unexpected shape, or no row for
+        the symbol (V2 lists every symbol, so a missing row is not "flat")."""
+        fetch = getattr(self.ex, "fapiPrivateV2GetAccount", None)
+        if fetch is None:
+            return None
+        try:
+            acct = fetch()
+        except Exception as e:
+            log.warning("account endpoint read failed: %s", e)
+            return None
+        rows = acct.get("positions") if isinstance(acct, dict) else None
+        if not isinstance(rows, list):
+            return None
+        mid = self._market_id(symbol)
+        total, matched = 0.0, False
+        for r in rows:
+            if not isinstance(r, dict) or r.get("symbol") != mid:
+                continue
+            try:
+                amt = float(r["positionAmt"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not math.isfinite(amt):
+                return None
+            matched = True
+            total += abs(amt)
+        return total if matched else None
 
     # --- order management ---------------------------------------------------
     def cancel_open_orders(self, symbol: str,
@@ -847,8 +895,13 @@ class BinanceClient:
                     assert side is not None and qty is not None
                     c_side, c_qty = side, float(qty)
                 else:
-                    p = self.fetch_position(symbol)
-                    if p.side == "flat" or p.qty == 0:
+                    # STRICT read (F4, 2026-11 fix-pass): a lenient flat here
+                    # used to sweep the root, return closed=True and let
+                    # _finish_no_stop clear state and mail "closed" with the
+                    # position possibly still open. PositionUnknown is an
+                    # attempt failure: retried, never "closed".
+                    p = self.fetch_position_checked(symbol)
+                    if p.side == "flat":
                         self._sweep_root_quietly(symbol, root)
                         return True, None, None
                     c_side, c_qty = p.side, p.qty
