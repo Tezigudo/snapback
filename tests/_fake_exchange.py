@@ -179,6 +179,16 @@ class FakeEx:
         return [{"symbol": SYMBOL, "contracts": qty, "side": side,
                  "entryPrice": entry, "unrealizedPnl": 0.0, "initialMargin": 10.0}]
 
+    def fapiPrivateV2GetAccount(self, params=None):  # ccxt name
+        # Independent of positionRisk: never lags (position_lag_reads ignored).
+        self.calls.append(("account", None))
+        amt = 0.0
+        if self.pos is not None:
+            side, qty, _entry = self.pos
+            amt = qty if side == "long" else -qty
+        return {"positions": [{"symbol": MARKET_ID, "positionAmt": str(amt),
+                               "positionSide": "BOTH"}]}
+
     def fetch_open_orders(self, symbol=None):
         self.calls.append(("fetch_open_orders", symbol))
         return [dict(o) for o in self.plain]
