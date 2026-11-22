@@ -309,3 +309,29 @@ def test_two_calls_in_one_tick_do_not_confirm():
     _tick(b)
     _tick(b)                                  # same tick: still 1/2
     _assert_untouched(b, mc)
+
+
+# --- F10: a bot close confirmed late is not called "manual close?" -----------
+
+def test_late_confirmation_of_a_bot_close_says_bot_close():
+    b, mc = _bot()
+    b._bot_close_unconfirmed = {"why": "time-stop", "leg": "x", "ts": 0.0}
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)   # sweep never ran
+    _tick(b)
+    alert = _tick(b)
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert any("bot time-stop close now confirmed flat" in s for s in subjects), subjects
+    assert not any("position flat, bracket" in s for s in subjects)
+    assert b._bot_close_unconfirmed is None
+
+
+def test_without_a_bot_close_it_still_asks_manual_close():
+    b, mc = _bot()
+    b._bot_close_unconfirmed = None
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    _tick(b)
+    alert = _tick(b)
+    body = " ".join(c.args[1] for c in alert.call_args_list)
+    assert "manual close or liquidation?" in body

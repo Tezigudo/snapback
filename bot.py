@@ -469,6 +469,7 @@ class Bot:
         self._prev_tick_wallet: float | None = None
         self._transfer_suspect: dict | None = None
         self._kill_grace: dict | None = None   # _withdrawal_grace (2026-11)
+        self._bot_close_unconfirmed: dict | None = None   # F10
         # One alert per process when the per-position re-place cap is hit — the
         # cap itself is persisted in active_bracket; this only de-dupes the mail.
         self._reprotect_capped_alerted: bool = False
@@ -3408,14 +3409,27 @@ class Bot:
             if stop_evidence:
                 msg = ("bracket still intact" if intact
                        else "algo book unreadable")
-                self.log.warning("%s: flat accepted after %d consecutive flat "
-                                 "ticks with no fill evidence (%s) — closed "
-                                 "outside the bot?", site, n, msg)
-                send_alert(f"{self.instance}: position flat, {msg}",
-                           f"{site}: {n} consecutive flat position reads, but "
-                           f"no evidence the SL or TP filled ({msg}). Treating the "
-                           f"position as closed (manual close or liquidation?) "
-                           f"and sweeping the leg's orders. Check Binance.")
+                bc = getattr(self, "_bot_close_unconfirmed", None)
+                self._bot_close_unconfirmed = None
+                if bc:
+                    # F10: the bot's own close, sent earlier but unconfirmed then.
+                    self.log.warning("%s: flat confirmed after the bot's %s close "
+                                     "(sent, unconfirmed at the time; %s)",
+                                     site, bc["why"], msg)
+                    send_alert(f"{self.instance}: bot {bc['why']} close now confirmed flat",
+                               f"{site}: the bot's {bc['why']} close was sent but "
+                               f"flat could not be confirmed at the time. {n} "
+                               f"consecutive flat reads now confirm it; sweeping the "
+                               f"leg's remaining orders ({msg}).")
+                else:
+                    self.log.warning("%s: flat accepted after %d consecutive flat "
+                                     "ticks with no fill evidence (%s) — closed "
+                                     "outside the bot?", site, n, msg)
+                    send_alert(f"{self.instance}: position flat, {msg}",
+                               f"{site}: {n} consecutive flat position reads, but "
+                               f"no evidence the SL or TP filled ({msg}). Treating the "
+                               f"position as closed (manual close or liquidation?) "
+                               f"and sweeping the leg's orders. Check Binance.")
             return True
         self.log.warning("%s: flat read awaiting confirmation (%d/%d)%s — "
                          "nothing cancelled or cleared this tick", site, n,
@@ -4716,12 +4730,17 @@ class Bot:
                                          f"Nothing was cancelled. Check Binance.")
             return None, flat
         if not flat:
+            # F10: remember it, so the flat edge that later confirms this
+            # position closed says "bot close", not "manual close?".
+            self._bot_close_unconfirmed = {"why": why, "leg": close_leg,
+                                           "ts": time.time()}
             self._alert_close_failed(close_leg, why,
                                      f"the close order was sent but the "
                                      f"position is NOT confirmed flat ({last}). "
                                      f"The stop and TP were NOT cancelled. "
                                      f"Check Binance.")
             return order, False
+        self._bot_close_unconfirmed = None
         try:
             self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
         except Exception:
