@@ -544,6 +544,22 @@ class BinanceClient:
             return [], False
         return rows, True
 
+    def tp_algo_status(self, symbol: str, root: str | None) -> str | None:
+        """algoStatus (upper-case) of this root's TP algo order, looked up by
+        clientAlgoId; None = unreadable / not found. One read; used only on the
+        flat edge, to tell a TP FILL from a hand-cancelled TP."""
+        coid = _coid(root, "t", self.coid_prefix)
+        fetch = getattr(self.ex, "fapiPrivateGetAlgoOrder", None)
+        if coid is None or fetch is None:
+            return None
+        try:
+            row = fetch({"clientAlgoId": coid})
+        except Exception as e:
+            log.warning("algo order %s status read failed: %s", coid, e)
+            return None
+        st = row.get("algoStatus") if isinstance(row, dict) else None
+        return str(st).upper() if st else None
+
     def _cancel_algo_orders(self, symbol: str, coid_prefix: str | None) -> int | None:
         """Sweep resting algo/conditional trigger orders (raw fapi endpoints).
 

@@ -97,6 +97,7 @@ def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
     state.set_meta(b.TP_PLACED_KEY, ROOT)        # this position's TP was placed
     mc.fetch_position_checked.return_value = _flat()
     mc.fetch_algo_orders.return_value = ([SL], True)
+    mc.tp_algo_status.return_value = "FINISHED"  # the TP's own status: it fired
     _tick(b)
     mc.cancel_open_orders.assert_called_once_with("BTC/USDT:USDT", coid_prefix="snap-v1-")
     assert _fills() == ["entry", "bracket_exit"]
@@ -418,3 +419,27 @@ def test_marker_from_another_root_is_ignored():
     alert = _tick(b)
     body = " ".join(c.args[1] for c in alert.call_args_list)
     assert "manual close or liquidation?" in body
+
+
+@pytest.mark.parametrize("status", ["CANCELED", "EXPIRED", None],
+                         ids=["canceled", "expired", "unreadable"])
+def test_hand_cancelled_tp_is_not_fill_evidence(status):
+    # sourcery 4657584894: TP missing + recorded placed, but its own status is
+    # not a fill -> debounce, nothing swept
+    b, mc = _bot()
+    state.set_meta(b.TP_PLACED_KEY, ROOT)
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL], True)
+    mc.tp_algo_status.return_value = status
+    _tick(b)
+    _assert_untouched(b, mc)
+
+
+def test_tp_algo_status_reads_by_client_algo_id():
+    c = _client([])
+    c.ex.fapiPrivateGetAlgoOrder.return_value = {"algoStatus": "finished"}
+    assert c.tp_algo_status("BTC/USDT:USDT", "123") == "FINISHED"
+    sent = c.ex.fapiPrivateGetAlgoOrder.call_args.args[0]
+    assert sent["clientAlgoId"].endswith("-t")
+    c.ex.fapiPrivateGetAlgoOrder.side_effect = RuntimeError("x")
+    assert c.tp_algo_status("BTC/USDT:USDT", "123") is None

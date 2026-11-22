@@ -3617,6 +3617,12 @@ class Bot:
                 # and must not then bypass the debounce.
                 intact = "sl" in legs and (
                     "tp" in legs or not self._tp_was_placed())
+                if "sl" in legs and "tp" not in legs and not intact:
+                    # sourcery 4657584894: a hand-cancelled TP looks the same as
+                    # a filled one. Count it as fill evidence only when the TP's
+                    # own algo status says it triggered; otherwise debounce.
+                    st = self.client.tp_algo_status(self.symbol, self._last_entry_root)
+                    intact = st not in ("FILLED", "FINISHED", "TRIGGERED", "TRIGGERING")
             if intact is False:
                 self._flat_clear(site)
                 # a fill-evidenced flat settles that position: the bot-close
