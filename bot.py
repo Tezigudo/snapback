@@ -3540,6 +3540,9 @@ class Bot:
                     "tp" in legs or not self._tp_was_placed())
             if intact is False:
                 self._flat_clear(site)
+                # a fill-evidenced flat settles that position: the bot-close
+                # marker must not leak onto a LATER, unrelated close (4657592255)
+                self._bot_close_unconfirmed = None
                 return True
         if n >= self.FLAT_ACCEPT_TICKS:
             self._flat_clear(site)
@@ -3548,6 +3551,8 @@ class Bot:
                        else "algo book unreadable")
                 bc = getattr(self, "_bot_close_unconfirmed", None)
                 self._bot_close_unconfirmed = None
+                if bc and bc.get("root") not in (None, getattr(self, "_last_entry_root", None)):
+                    bc = None   # marker belongs to another position
                 if bc:
                     # F10: the bot's own close, sent earlier but unconfirmed then.
                     self.log.warning("%s: flat confirmed after the bot's %s close "
@@ -3621,7 +3626,7 @@ class Bot:
         self._last_position_qty = qty
         self._last_entry_root = root
 
-    def _detect_bracket_exit(self, equity: float) -> None:
+    def _detect_bracket_exit(self, equity: float, *, flat_confirmed: bool = False) -> None:
         """Bracket SL/TP fills close the position on Binance's side without
         a bot-initiated close. Detect that the tracked position has ENDED and
         emit an exit alert with PnL.
@@ -3686,7 +3691,11 @@ class Bot:
             # there must not sweep it. A genuine flat-edge retry confirms on the
             # fast path anyway (its first pass swept, the algo book is empty).
             if current == "flat" and had_open:
-                if not self._confirm_flat(self.BRACKET_SITE, stop_evidence=True):
+                # flat_confirmed: the caller (HALT / kill) already strictly
+                # confirmed flat, so the debounce would only block the booking
+                # (sourcery 4657592243).
+                if not flat_confirmed and not self._confirm_flat(
+                        self.BRACKET_SITE, stop_evidence=True):
                     return
             else:
                 self._flat_clear(self.BRACKET_SITE)
@@ -4493,6 +4502,13 @@ class Bot:
                                      else "NOT confirmed flat")
                     return
                 exit_price = self._resolve_fill_price(order)
+                if not exit_price:
+                    # sourcery 4657591036: an acknowledged close with no fill price
+                    # (EXPIRED / not attributed) must not be booked at 0.0 — that
+                    # would hide the real SL fill from the flat edge.
+                    self.log.warning("time-stop: close fill price unknown — nothing "
+                                     "recorded; the flat edge records the real exit")
+                    return
                 _entry = self._open_entry_fill()
                 state.record_fill(side="close", qty=pos.qty,
                                   price=float(exit_price or 0.0),
@@ -4581,6 +4597,10 @@ class Bot:
                                  else "NOT confirmed flat")
                 return
             exit_price = self._resolve_fill_price(order)
+            if not exit_price:
+                self.log.warning("trend-exit: close fill price unknown — nothing "
+                                 "recorded; the flat edge records the real exit")
+                return
             _entry = self._open_entry_fill()
             state.record_fill(side="close", qty=pos.qty,
                               price=float(exit_price or 0.0),
@@ -4887,7 +4907,7 @@ class Bot:
             # F10: remember it, so the flat edge that later confirms this
             # position closed says "bot close", not "manual close?".
             self._bot_close_unconfirmed = {"why": why, "leg": close_leg,
-                                           "ts": time.time()}
+                                           "ts": time.time(), "root": root}
             self._alert_close_failed(close_leg, why,
                                      f"the close order was sent but the "
                                      f"position is NOT confirmed flat ({last}). "
@@ -4964,6 +4984,46 @@ class Bot:
             self.log.exception("%s: unverified-entry exit check failed", why)
             return True
 
+    def _ledger_unbooked_exit(self) -> bool | None:
+        """True = newest ledger row is still an entry (exit not booked); False =
+        it is not; None = the ledger could not be read (`_open_entry_fill`
+        swallows its own DB error, so probe the read directly)."""
+        try:
+            with sqlite3.connect(state.DB_PATH) as c:
+                c.execute("SELECT 1 FROM fills LIMIT 1").fetchall()
+        except Exception:
+            return None
+        return self._open_entry_fill() is not None
+
+    def _book_halt_kill_close(self, order: dict | None, reason: str, root: str | None,
+                              equity: float | None) -> None:
+        """A HALT / kill close that was sent AND strictly confirmed flat wrote
+        no close row at all (pre-existing gap, sourcery 4657592243). Book it from
+        the order's own fill price. Falls back to the exchange-trade detector
+        when the price is unknown. NEVER raises: the position is already flat."""
+        try:
+            side = getattr(self, "_last_position_side", "unknown")
+            qty = getattr(self, "_last_position_qty", None)
+            if order is None or side in ("flat", "unknown") or not qty:
+                return
+            entry = self._open_entry_fill()
+            if entry is None:
+                return   # newest row is not an open entry: nothing owed
+            price = self._resolve_fill_price(order)
+            if not price:
+                self._detect_bracket_exit(float(equity) if equity is not None
+                                          else float("nan"), flat_confirmed=True)
+                return
+            state.record_fill(side="close", qty=float(qty), price=float(price),
+                              pnl_usd=_exit_pnl_usd(side, entry[2], price, float(qty)),
+                              reason=reason, equity_after=self._ledger_equity(equity),
+                              client_order_id_root=root)
+            state.enqueue_bot_event(
+                "exit", signal_id=root, side=side, qty=float(qty), price_usd=price,
+                equity_usd=self._ledger_equity(equity), payload={"reason": reason})
+        except Exception:
+            self.log.exception("%s: booking the confirmed close failed", reason)
+
     def _exit_found_flat(self, why: str) -> None:
         """G3 (round 3): HALT / kill found the position ALREADY flat (strictly
         confirmed, nothing sent). The process is about to exit, so no later
@@ -4979,7 +5039,8 @@ class Bot:
                 # nothing is known at all (round 4 check of G3).
                 self._equity_stale = True
                 eq = getattr(self, "_last_known_equity", None)
-                self._detect_bracket_exit(float(eq) if eq is not None else float("nan"))
+                self._detect_bracket_exit(float(eq) if eq is not None else float("nan"),
+                                          flat_confirmed=True)
         except Exception:
             self.log.exception("%s: exit detection before exit failed", why)
         n = None
@@ -4987,10 +5048,7 @@ class Bot:
             n = self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
         except Exception:
             self.log.exception("%s: pre-exit sweep failed", why)
-        try:
-            unbooked = self._open_entry_fill() is not None
-        except Exception:
-            unbooked = None
+        unbooked = self._ledger_unbooked_exit()
         msg = (f"{why}: the position was already flat (confirmed) when the bot went "
                f"to close it. Leg orders swept: {n if n is not None else 'FAILED'}. "
                + ("The exit is NOT in the ledger (newest fill is still the entry): "
@@ -5072,6 +5130,10 @@ class Bot:
                              "leaving the exit to _detect_bracket_exit")
             return True
         exit_price = self._resolve_fill_price(order)
+        if not exit_price:
+            self.log.warning("Breakeven: close fill price unknown — nothing "
+                             "recorded; the flat edge records the real exit")
+            return True
         _entry = self._open_entry_fill()
         state.record_fill(side="close", qty=pos.qty, price=float(exit_price or 0.0),
                           pnl_usd=_exit_pnl_usd(pos.side, _entry[2] if _entry else None,
@@ -5134,6 +5196,11 @@ class Bot:
                             continue
                         if halt_flat and _o is None:
                             self._exit_found_flat("HALT")   # G3
+                        elif halt_flat:
+                            self._equity_stale = True
+                            self._book_halt_kill_close(
+                                _o, "halt_close", root,
+                                getattr(self, "_last_known_equity", None))
                         if not halt_flat:
                             # F5: do NOT exit while flat is unconfirmed. The
                             # units restart only on-failure, so `return 0` here
@@ -5210,6 +5277,8 @@ class Bot:
                             continue   # HALT_<leg> exists: the HALT path retries
                         if kill_flat and _o is None:
                             self._exit_found_flat("kill-switch")   # G3
+                        elif kill_flat:
+                            self._book_halt_kill_close(_o, "kill_close", root, equity)
                         if not kill_flat:
                             # F5: same as HALT — stay alive; HALT_<leg> now
                             # exists, so the next tick's HALT branch retries

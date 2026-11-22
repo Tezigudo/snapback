@@ -634,3 +634,80 @@ def test_halt_exits_once_the_entry_order_is_proven_gone_and_flat():
     with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
          patch("bot.consolidate_push.drain"):
         assert b.loop() == 0
+
+
+# --- sourcery 4657592243 / 4657592261 / 4657591036: exit bookkeeping ----------
+
+def _seed_open_long(b):
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+
+
+def _reasons():
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+
+
+def test_halt_found_flat_with_an_intact_bracket_still_books_the_exit():
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    _seed_open_long(b)
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    # bracket fully intact: the debounce alone would never book on this tick
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([{"clientAlgoId": "snap-v1-r1-s"},
+                                          {"clientAlgoId": "snap-v1-r1-t"}], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.consolidate_push"):
+        assert b.loop() == 0
+    assert _reasons() == ["entry", "bracket_exit"]
+
+
+def test_halt_close_sent_and_confirmed_books_a_halt_close_row():
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    _seed_open_long(b)
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1", "average": 64_500.0}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.consolidate_push"):
+        assert b.loop() == 0
+    assert _reasons() == ["entry", "halt_close"]
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        px, pnl, eq = c.execute("SELECT price, pnl_usd, equity_after FROM fills "
+                                "WHERE reason='halt_close'").fetchone()
+    assert px == 64_500.0 and pnl == pytest.approx(-5.0) and eq is None
+
+
+def test_found_flat_mail_says_unreadable_when_the_ledger_cannot_be_read():
+    b, mc = _bot()
+    _seed_open_long(b)
+    b._last_position_side = "flat"          # skip the detector
+    with patch("bot.sqlite3.connect", side_effect=RuntimeError("db locked")), \
+         patch("bot.send_alert") as alert:
+        b._exit_found_flat("HALT")
+    body = alert.call_args.args[1]
+    assert "unreadable" in body and "recorded" not in body.replace("unreadable", "")
+
+
+def test_time_stop_close_with_unknown_fill_price_books_nothing():
+    b, mc = _time_stop_bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"average": 0.0}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("flat", 0.0, 0.0)
+    b._resolve_fill_price = lambda order: None
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    assert "time_stop" not in _reasons()

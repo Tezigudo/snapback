@@ -390,3 +390,31 @@ def test_v2_used_first_when_it_answers():
     _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0"}])
     c.fetch_position_checked("BTC/USDT:USDT")
     c.ex.fapiPrivateV3GetAccount.assert_not_called()
+
+
+# --- sourcery 4657592255: the bot-close marker is keyed to its own position ---
+
+def test_marker_cleared_by_a_fill_evidenced_flat_does_not_label_a_later_manual_close():
+    b, mc = _bot()
+    b._bot_close_unconfirmed = {"why": "time-stop", "leg": "x", "ts": 0.0, "root": "r1"}
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([TP], True)          # SL gone: fill evidence
+    assert b._confirm_flat(b.BRACKET_SITE, stop_evidence=True) is True
+    assert b._bot_close_unconfirmed is None
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)      # next position, manual close
+    _tick(b)
+    alert = _tick(b)
+    body = " ".join(c.args[1] for c in alert.call_args_list)
+    assert "manual close or liquidation?" in body
+
+
+def test_marker_from_another_root_is_ignored():
+    b, mc = _bot()
+    b._last_entry_root = "r2"
+    b._bot_close_unconfirmed = {"why": "time-stop", "leg": "x", "ts": 0.0, "root": "r1"}
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    _tick(b)
+    alert = _tick(b)
+    body = " ".join(c.args[1] for c in alert.call_args_list)
+    assert "manual close or liquidation?" in body
