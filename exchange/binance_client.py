@@ -895,8 +895,13 @@ class BinanceClient:
                     assert side is not None and qty is not None
                     c_side, c_qty = side, float(qty)
                 else:
-                    p = self.fetch_position(symbol)
-                    if p.side == "flat" or p.qty == 0:
+                    # STRICT read (F4, 2026-11 fix-pass): a lenient flat here
+                    # used to sweep the root, return closed=True and let
+                    # _finish_no_stop clear state and mail "closed" with the
+                    # position possibly still open. PositionUnknown is an
+                    # attempt failure: retried, never "closed".
+                    p = self.fetch_position_checked(symbol)
+                    if p.side == "flat":
                         self._sweep_root_quietly(symbol, root)
                         return True, None, None
                     c_side, c_qty = p.side, p.qty
