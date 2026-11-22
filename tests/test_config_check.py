@@ -305,6 +305,9 @@ DOCUMENTED_OPTIONAL = frozenset({
     "max_replaces_per_position", "max_sl_place_failures",
     "unknown_book_close_after_s", "dedup_bars", "use_mtf_4h_gate",
     "require_trend", "manual_principal_usdt",
+    # bot._check_time_stop_parity (2026-11): read only to compare with
+    # max_hold_bars at boot; absent = check skipped, never a live default.
+    "time_stop_bars",
 })
 
 _ALL_STRATS = tuple(sorted(REQUIRED_KEYS))
