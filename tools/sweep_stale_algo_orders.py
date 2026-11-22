@@ -19,6 +19,12 @@ order on the symbol, live SLs and other legs' orders included):
     (orphans of closed trades) are cancelled.
   - Position confirmed FLAT: every one of OUR resting algo orders is stale.
 
+Race (sourcery 4657588350): the algo book is read BEFORE the position, and the
+position is re-read strictly right before --execute (abort exit 3 if it
+changed), so a bracket placed by a live bot between the reads is never
+classified against a stale "flat". Still: STOP THE LEG FIRST — the tool is a
+one-off cleanup, not safe to run beside a live bot.
+
 Dry-run by default; pass --execute to actually cancel. Run on the droplet with
 the target leg's env active (base .env = v1):
 
@@ -85,6 +91,9 @@ def main(argv: list[str] | None = None, ex: ccxt.Exchange | None = None) -> int:
             return 2
         ex = ccxt.binanceusdm({"apiKey": key, "secret": sec})
     client = BinanceClient(ex=ex, env="tool", coid_prefix=args.prefix)
+    # book FIRST: a bracket seen here implies its position was already open
+    # when the position is read next
+    rows = ex.fapiPrivateGetOpenAlgoOrders({"symbol": args.symbol})
     try:
         pos = client.fetch_position_checked(_ccxt_symbol(args.symbol))
     except PositionUnknown as e:
@@ -93,7 +102,6 @@ def main(argv: list[str] | None = None, ex: ccxt.Exchange | None = None) -> int:
         return 3
     print(f"{args.symbol} position: {pos.side} {pos.qty} (confirmed)")
 
-    rows = ex.fapiPrivateGetOpenAlgoOrders({"symbol": args.symbol})
     keep, cancel, foreign = classify(rows, args.prefix, pos.side)
     print(f"open algo orders: {len(rows)} | keep {len(keep)} | cancel {len(cancel)} "
           f"| not ours (left) {len(foreign)}")
@@ -109,6 +117,15 @@ def main(argv: list[str] | None = None, ex: ccxt.Exchange | None = None) -> int:
     if not args.execute:
         print("\nDRY-RUN — nothing cancelled. Re-run with --execute to cancel.")
         return 0
+    try:
+        again = client.fetch_position_checked(_ccxt_symbol(args.symbol))
+    except PositionUnknown as e:
+        print(f"ABORT: position re-read UNKNOWN ({e}) — nothing cancelled.", file=sys.stderr)
+        return 3
+    if again.side != pos.side:
+        print(f"ABORT: position changed {pos.side} -> {again.side} during the run — "
+              f"nothing cancelled.", file=sys.stderr)
+        return 3
     ok = fail = 0
     for r in cancel:
         try:

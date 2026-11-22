@@ -888,7 +888,11 @@ class Bot:
                 return "invalid"
         live = _bars(s.get("max_hold_bars"))
         live = 0 if live is None else live
+        if bt_key == "max_hold_bars":
+            return True   # same key on both sides: parity by construction
         bt = _bars(s.get(bt_key))
+        if bt is None and live == 0:
+            bt = 0        # both off (sourcery 4657592269)
         if bt == live:
             return True
         self.log.error("PARAMS PARITY (%s): backtest strategy.%s=%r != live "
