@@ -357,3 +357,53 @@ def test_breakeven_close_unconfirmed_books_nothing_and_keeps_be_moved_false():
     assert "Bot breakeven close" not in subjects
     assert any("breakeven close FAILED" in s for s in subjects)
     mc.cancel_open_orders.assert_not_called()
+
+
+# --- G3 (round 3): HALT/kill that find the position already flat ------------
+
+def test_halt_found_flat_sweeps_books_and_alerts_before_exiting():
+    import sqlite3
+
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None            # already flat: nothing sent
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([], True)   # the SL filled
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.halt_source", return_value="self"), \
+         patch("bot.send_alert") as alert, patch("bot.consolidate_push"):
+        assert b.loop() == 0
+    with sqlite3.connect(state.DB_PATH) as c:
+        reasons = [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+    assert reasons == ["entry", "bracket_exit"]                 # real exit booked
+    assert mc.cancel_open_orders.call_count >= 1                # brackets swept
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert any("HALT found the position already flat" in s for s in subjects)
+
+
+def test_kill_found_flat_with_unbookable_exit_alerts_reconcile():
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    b._last_position_side = "unknown"                # nothing to detect from
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    b._kill_switch_after_reconcile = lambda equity: True
+    mc.fetch_equity_usdt.return_value = 10.0
+    with patch("bot.halt_source", return_value=None), patch("bot.send_alert") as alert:
+        assert b.loop() == 0
+    bodies = [c.args[1] for c in alert.call_args_list
+              if "kill-switch found the position already flat" in c.args[0]]
+    assert bodies and "NOT in the ledger" in bodies[0]
+    mc.cancel_open_orders.assert_called_once()

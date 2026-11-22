@@ -4803,6 +4803,39 @@ class Bot:
             self.log.exception("%s close: post-close sweep failed", why)
         return order, True
 
+    def _exit_found_flat(self, why: str) -> None:
+        """G3 (round 3): HALT / kill found the position ALREADY flat (strictly
+        confirmed, nothing sent). The process is about to exit, so no later
+        flat edge will run: book the exit now if the detector can, sweep the
+        leg's resting orders (safe — flat is confirmed), and mail what was and
+        was not recorded. NEVER raises."""
+        try:
+            if getattr(self, "_last_position_side", "unknown") not in ("flat", "unknown"):
+                eq = getattr(self, "_last_known_equity", None)
+                self._detect_bracket_exit(float(eq) if eq is not None else 0.0)
+        except Exception:
+            self.log.exception("%s: exit detection before exit failed", why)
+        n = None
+        try:
+            n = self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
+        except Exception:
+            self.log.exception("%s: pre-exit sweep failed", why)
+        try:
+            unbooked = self._open_entry_fill() is not None
+        except Exception:
+            unbooked = None
+        msg = (f"{why}: the position was already flat (confirmed) when the bot went "
+               f"to close it. Leg orders swept: {n if n is not None else 'FAILED'}. "
+               + ("The exit is NOT in the ledger (newest fill is still the entry): "
+                  "reconcile it from Binance." if unbooked else
+                  "The exit is recorded." if unbooked is False else
+                  "Ledger state unreadable: check the exit."))
+        self.log.warning("%s", msg)
+        try:
+            send_alert(f"{self.instance}: {why} found the position already flat", msg)
+        except Exception:
+            self.log.exception("%s: found-flat alert failed", why)
+
     def _strict_flat_reads(self) -> tuple[bool, str]:
         """(confirmed_flat, last_observation) from up to CLOSE_CONFIRM_READS
         strict reads. An unreadable payload is never flat."""
@@ -4910,6 +4943,8 @@ class Bot:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries next tick
                         _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
+                        if halt_flat and _o is None:
+                            self._exit_found_flat("HALT")   # G3
                         if not halt_flat:
                             # F5: do NOT exit while flat is unconfirmed. The
                             # units restart only on-failure, so `return 0` here
@@ -4978,6 +5013,8 @@ class Bot:
                         # raises → stops kept, alert sent, loop retries (the
                         # kill switch wrote HALT, so the HALT path re-closes)
                         _o, kill_flat = self._close_then_sweep(root, "k", "kill-switch")
+                        if kill_flat and _o is None:
+                            self._exit_found_flat("kill-switch")   # G3
                         if not kill_flat:
                             # F5: same as HALT — stay alive; HALT_<leg> now
                             # exists, so the next tick's HALT branch retries
