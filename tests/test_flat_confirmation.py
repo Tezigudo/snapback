@@ -262,10 +262,36 @@ def test_empty_list_without_independent_confirmation_is_unknown(acct):
         c.fetch_position_checked("BTC/USDT:USDT")
 
 
-def test_explicit_zero_row_is_flat_without_the_account_read():
-    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+def test_explicit_zero_row_is_cross_checked_against_the_account_endpoint():
+    # V3 positionRisk returns a zero row whenever orders rest; that must not
+    # bypass the independent account read (sourcery 4657584890)
+    zero = [{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}]
+    c = _client(zero)
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0.010"}])
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0"}])
     assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
-    c.ex.fapiPrivateV2GetAccount.assert_not_called()
+
+
+def test_explicit_zero_row_stays_flat_when_the_account_endpoint_errors():
+    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    c.ex.fapiPrivateV2GetAccount.side_effect = RuntimeError("timeout")
+    c.ex.fapiPrivateV3GetAccount.side_effect = RuntimeError("timeout")
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+
+
+def test_lagging_account_read_is_absorbed_by_the_second_strict_read():
+    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    c.ex.fapiPrivateV2GetAccount.side_effect = [
+        {"positions": [{"symbol": "BTCUSDT", "positionAmt": "0.010"}]},
+        {"positions": [{"symbol": "BTCUSDT", "positionAmt": "0"}]}]
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
 
 
 @pytest.mark.parametrize("payload", [

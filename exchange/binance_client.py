@@ -348,7 +348,11 @@ class BinanceClient:
         the V2 account positions array, which lists every symbol including
         zero ones). Zero there → flat; non-zero → PositionUnknown (the two
         endpoints disagree); unreadable → PositionUnknown. An explicit row with
-        contracts == 0 is a positive "flat" from positionRisk itself.
+        contracts == 0 is ALSO cross-checked (V3 returns zero rows whenever
+        orders rest, i.e. exactly at the bracket flat edge): non-zero account →
+        PositionUnknown, but an unreadable account endpoint keeps that explicit
+        flat, so an account outage is not a total entry block.
+        Account endpoint: V2 then V3; under V3 an absent row is unknown, not flat.
         """
         positions = self.ex.fetch_positions([symbol])
         if not isinstance(positions, list):
@@ -377,16 +381,16 @@ class BinanceClient:
                 unrealized_pnl=float(p.get("unrealizedPnl") or 0.0),
                 margin_used=float(p.get("initialMargin") or 0.0),
             )
+        amt = self._account_position_amt(symbol)
+        if amt is not None and amt > 0:
+            raise PositionUnknown(
+                f"positionRisk reads {symbol} flat but the account endpoint "
+                f"shows |positionAmt|={amt}")
         if not seen_row:
-            amt = self._account_position_amt(symbol)
             if amt is None:
                 raise PositionUnknown(
                     f"positionRisk has no {symbol} row and the account endpoint "
                     f"could not confirm flat")
-            if amt > 0:
-                raise PositionUnknown(
-                    f"positionRisk has no {symbol} row but the account endpoint "
-                    f"shows |positionAmt|={amt}")
         return Position(symbol=symbol, side="flat", qty=0.0,
                         entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
 
