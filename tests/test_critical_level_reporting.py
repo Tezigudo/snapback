@@ -33,3 +33,8 @@ def test_dashboard_lists_critical_lines():
                           logs, "v1")
     assert "No errors or warnings" not in html        # it is in the errors table
     assert "<tr class='row-err'>" in html             # and styled as an error row
+    # sourcery 4657592272: the ERRORS table rows have no logger column, the
+    # events table rows do, so this pins the errors table specifically
+    import re
+    assert re.search(r"<tr class='row-err'><td>[^<]*</td><td>CRITICAL</td>"
+                     r"<td>[^<]*UNIQUE_CRIT_MARKER", html)

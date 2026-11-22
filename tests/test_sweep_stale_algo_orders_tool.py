@@ -73,3 +73,24 @@ def test_dry_run_cancels_nothing():
     ex = _ex([], account_amt=0.0)
     assert tool.main(["--prefix", "snap-d3-"], ex=ex) == 0
     ex.fapiPrivateDeleteAlgoOrder.assert_not_called()
+
+
+def test_position_flipping_between_reads_cancels_nothing():
+    # sourcery 4657588350: flat at the first read, a live long (with its
+    # bracket) by the pre-execute re-read -> abort, cancel nothing
+    zero = {"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}
+    long_ = {"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "long"}
+    ex = _ex([zero], account_amt=0.0)
+    ex.fetch_positions.side_effect = [[zero], [long_]]
+    assert tool.main(["--prefix", "snap-d3-", "--execute"], ex=ex) == 3
+    ex.fapiPrivateDeleteAlgoOrder.assert_not_called()
+
+
+def test_algo_book_is_read_before_the_position():
+    ex = _ex([], account_amt=0.0)
+    order = []
+    ex.fapiPrivateGetOpenAlgoOrders.side_effect = lambda *a, **k: (
+        order.append("book"), [dict(r) for r in ROWS])[1]
+    ex.fetch_positions.side_effect = lambda *a, **k: (order.append("pos"), [])[1]
+    tool.main(["--prefix", "snap-d3-"], ex=ex)
+    assert order[0] == "book" and "pos" in order

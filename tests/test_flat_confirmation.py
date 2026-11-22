@@ -97,6 +97,7 @@ def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
     state.set_meta(b.TP_PLACED_KEY, ROOT)        # this position's TP was placed
     mc.fetch_position_checked.return_value = _flat()
     mc.fetch_algo_orders.return_value = ([SL], True)
+    mc.tp_algo_status.return_value = "FINISHED"  # the TP's own status: it fired
     _tick(b)
     mc.cancel_open_orders.assert_called_once_with("BTC/USDT:USDT", coid_prefix="snap-v1-")
     assert _fills() == ["entry", "bracket_exit"]
@@ -262,10 +263,36 @@ def test_empty_list_without_independent_confirmation_is_unknown(acct):
         c.fetch_position_checked("BTC/USDT:USDT")
 
 
-def test_explicit_zero_row_is_flat_without_the_account_read():
-    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+def test_explicit_zero_row_is_cross_checked_against_the_account_endpoint():
+    # V3 positionRisk returns a zero row whenever orders rest; that must not
+    # bypass the independent account read (sourcery 4657584890)
+    zero = [{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}]
+    c = _client(zero)
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0.010"}])
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0"}])
     assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
-    c.ex.fapiPrivateV2GetAccount.assert_not_called()
+
+
+def test_explicit_zero_row_stays_flat_when_the_account_endpoint_errors():
+    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    c.ex.fapiPrivateV2GetAccount.side_effect = RuntimeError("timeout")
+    c.ex.fapiPrivateV3GetAccount.side_effect = RuntimeError("timeout")
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+
+
+def test_lagging_account_read_is_absorbed_by_the_second_strict_read():
+    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    c.ex.fapiPrivateV2GetAccount.side_effect = [
+        {"positions": [{"symbol": "BTCUSDT", "positionAmt": "0.010"}]},
+        {"positions": [{"symbol": "BTCUSDT", "positionAmt": "0"}]}]
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
 
 
 @pytest.mark.parametrize("payload", [
@@ -364,3 +391,55 @@ def test_v2_used_first_when_it_answers():
     _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0"}])
     c.fetch_position_checked("BTC/USDT:USDT")
     c.ex.fapiPrivateV3GetAccount.assert_not_called()
+
+
+# --- sourcery 4657592255: the bot-close marker is keyed to its own position ---
+
+def test_marker_cleared_by_a_fill_evidenced_flat_does_not_label_a_later_manual_close():
+    b, mc = _bot()
+    b._bot_close_unconfirmed = {"why": "time-stop", "leg": "x", "ts": 0.0, "root": "r1"}
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([TP], True)          # SL gone: fill evidence
+    assert b._confirm_flat(b.BRACKET_SITE, stop_evidence=True) is True
+    assert b._bot_close_unconfirmed is None
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)      # next position, manual close
+    _tick(b)
+    alert = _tick(b)
+    body = " ".join(c.args[1] for c in alert.call_args_list)
+    assert "manual close or liquidation?" in body
+
+
+def test_marker_from_another_root_is_ignored():
+    b, mc = _bot()
+    b._last_entry_root = "r2"
+    b._bot_close_unconfirmed = {"why": "time-stop", "leg": "x", "ts": 0.0, "root": "r1"}
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    _tick(b)
+    alert = _tick(b)
+    body = " ".join(c.args[1] for c in alert.call_args_list)
+    assert "manual close or liquidation?" in body
+
+
+@pytest.mark.parametrize("status", ["CANCELED", "EXPIRED", None],
+                         ids=["canceled", "expired", "unreadable"])
+def test_hand_cancelled_tp_is_not_fill_evidence(status):
+    # sourcery 4657584894: TP missing + recorded placed, but its own status is
+    # not a fill -> debounce, nothing swept
+    b, mc = _bot()
+    state.set_meta(b.TP_PLACED_KEY, ROOT)
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL], True)
+    mc.tp_algo_status.return_value = status
+    _tick(b)
+    _assert_untouched(b, mc)
+
+
+def test_tp_algo_status_reads_by_client_algo_id():
+    c = _client([])
+    c.ex.fapiPrivateGetAlgoOrder.return_value = {"algoStatus": "finished"}
+    assert c.tp_algo_status("BTC/USDT:USDT", "123") == "FINISHED"
+    sent = c.ex.fapiPrivateGetAlgoOrder.call_args.args[0]
+    assert sent["clientAlgoId"].endswith("-t")
+    c.ex.fapiPrivateGetAlgoOrder.side_effect = RuntimeError("x")
+    assert c.tp_algo_status("BTC/USDT:USDT", "123") is None

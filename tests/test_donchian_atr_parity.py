@@ -73,3 +73,12 @@ def test_time_stop_parity_check_per_leg(caplog):
     assert _b({"max_hold_bars": 96, "time_stop_bars": 0}, "multifactor-v1")._check_time_stop_parity()
     # unknown backtest key: not checked
     assert _b({"max_hold_bars": 5}, "supertrend")._check_time_stop_parity()
+
+
+def test_multifactor_v1_with_max_hold_bars_unset_has_parity_and_logs_no_error(caplog):
+    # sourcery 4657592269: same key on both sides = parity by construction
+    b = _b({})
+    b.strategy_name = "multifactor-v1"
+    with caplog.at_level("ERROR"):
+        assert b._check_time_stop_parity() is True
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]

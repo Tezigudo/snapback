@@ -54,6 +54,16 @@ def _pending_after_failed_close(params=DONCH_PARAMS):
     return bot, ex
 
 
+
+def _only_reads_and_entry_cancel(calls) -> bool:
+    """Read-only, plus the cancel of the root's own `-e` entry order (the
+    abandon path watches it: sourcery 4657588356) - never a close or a sweep."""
+    return all(c[0] in ("fetch_positions", "fetch_order", "fetch_open_orders")
+               or (c[0] == "cancel_order" and len(c) > 3
+                   and str(c[3].get("origClientOrderId", "")).endswith("-e"))
+               for c in calls)
+
+
 class TestItem1StalePendingNeverTouchesAnotherPosition:
 
     def test_entries_are_blocked_while_a_close_is_pending(self) -> None:
@@ -93,7 +103,9 @@ class TestItem1StalePendingNeverTouchesAnotherPosition:
         with patch("bot.send_alert") as alert:
             bot._maybe_finish_no_stop_close(150.0)
         new_calls = ex.calls[n:]
-        assert all(c[0] == "fetch_positions" for c in new_calls), new_calls
+        # read-only only (the entry order's filled qty is read to attribute a
+        # residual before abandoning: sourcery 4657588370)
+        assert _only_reads_and_entry_cancel(new_calls), new_calls
         assert ex.algo == before_algo and ex.pos == pos
         assert bot._pending_record() is None
         assert any("ABANDONED" in s for s in _subjects(alert))
@@ -105,7 +117,7 @@ class TestItem1StalePendingNeverTouchesAnotherPosition:
         n = len(ex.calls)
         with patch("bot.send_alert"):
             bot._maybe_finish_no_stop_close(150.0)
-        assert all(c[0] == "fetch_positions" for c in ex.calls[n:])
+        assert _only_reads_and_entry_cancel(ex.calls[n:])
         assert ex.pos is not None
 
     def test_the_emergency_sweep_is_scoped_to_its_own_root(self) -> None:

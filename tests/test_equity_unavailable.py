@@ -150,7 +150,7 @@ def test_time_stop_still_fires_while_equity_unreadable(tmp_path):
         c.execute("UPDATE fills SET ts='2020-01-01T00:00:00+00:00'")
     mc.fetch_equity_usdt.side_effect = EquityUnavailable("no key")
     mc.fetch_position.return_value = _open()
-    mc.close_position.return_value = {}
+    mc.close_position.return_value = {"id": "1", "average": 65100.0}
     bot._last_known_equity = 1000.0
     for h in ("_detect_bracket_exit", "_maybe_channel_exit", "_maybe_breakeven",
               "_maybe_reprotect", "_maybe_enter"):

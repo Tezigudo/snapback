@@ -35,6 +35,7 @@ USAGE:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -721,9 +722,9 @@ class Bot:
                 # deriveLegStats then counts as a loss).
                 # Refetch: the create response carries avgPrice "0.00", so the
                 # old `or pos.entry_price` fallback always fired and made every
-                # boot-flatten report PnL of exactly 0.
-                close_price = (self._resolve_fill_price(close_order)
-                               or pos.entry_price)
+                # boot-flatten report PnL of exactly 0. sourcery 4657591036: an
+                # unresolved price stays UNKNOWN (None) — never the entry price.
+                close_price = self._resolve_fill_price(close_order)
                 try:
                     equity_after = float(self.client.fetch_equity_usdt())
                 except Exception:
@@ -742,10 +743,10 @@ class Bot:
                     signal_id=root,
                     side=pos.side,
                     qty=float(pos.qty),
-                    price_usd=float(close_price),
+                    price_usd=float(close_price) if close_price else None,
                     equity_usd=equity_after,
                     payload={"reason": "stale_position_at_boot",
-                             "exit_price": float(close_price),
+                             "exit_price": float(close_price) if close_price else None,
                              "entry_price": float(pos.entry_price),
                              "pnl_usd": pnl_usd},
                 )
@@ -794,7 +795,7 @@ class Bot:
                 f"Leg: {self.instance} ({self.symbol})\n"
                 f"Side: {pos.side}  Size: {pos.qty:.6f} {self.base_asset}\n"
                 f"Entry: {pos.entry_price:,.4f}  Close: "
-                f"{(close_price or 0.0):,.4f}  PnL: "
+                f"{(f'{close_price:,.4f}' if close_price else 'unknown')}  PnL: "
                 + (f"${pnl_usd:+,.2f}" if pnl_usd is not None else "unknown")
                 + f"\nReason: restart found an open position; not resumed "
                 f"({reason}).\n"
@@ -888,7 +889,11 @@ class Bot:
                 return "invalid"
         live = _bars(s.get("max_hold_bars"))
         live = 0 if live is None else live
+        if bt_key == "max_hold_bars":
+            return True   # same key on both sides: parity by construction
         bt = _bars(s.get(bt_key))
+        if bt is None and live == 0:
+            bt = 0        # both off (sourcery 4657592269)
         if bt == live:
             return True
         self.log.error("PARAMS PARITY (%s): backtest strategy.%s=%r != live "
@@ -1091,8 +1096,17 @@ class Bot:
             except Exception as e:
                 self.log.warning("kill pre-check: principal reconcile failed: %s", e)
             P2 = principal.get_principal()
+            # a withdrawal booked by THIS reconcile is already in P2: do not
+            # count the same wallet drop again as "unbooked" (sourcery 4657581919)
+            # sourcery 4657581919: ... and nor one booked by the hourly reconcile at
+            # the top of THIS tick: measure from the principal at tick start.
+            P0 = getattr(self, "_tick_start_principal", None)
+            base = P0 if isinstance(P0, (int, float)) else P
+            booked = (float(base) - float(P2)
+                      if isinstance(base, (int, float)) and isinstance(P2, (int, float))
+                      else 0.0)
             if principal.breached(equity, P2, self.kill_fraction) and \
-                    self._withdrawal_grace(equity, P2):
+                    self._withdrawal_grace(equity, P2, booked):
                 return False
         except Exception as e:
             # The pre-check must never stand between the leg and its kill
@@ -1101,7 +1115,8 @@ class Bot:
             self._kill_grace = None
         return self._check_kill_switch(equity)
 
-    def _withdrawal_grace(self, equity: float, P: float | None) -> bool:
+    def _withdrawal_grace(self, equity: float, P: float | None,
+                          booked: float = 0.0) -> bool:
         """True = defer the kill THIS tick: the breach is explained by a wallet
         drop that is (a) unexplained by any position change or fill, (b) not yet
         in the principal ledger, and (c) without which equity is NOT breached.
@@ -1114,7 +1129,7 @@ class Bot:
             ledger = state.principal_ledger_sum(principal.PRINCIPAL_ASSET,
                                                 self.LAST_BAR_PERSIST_TIMEOUT_S)
             fill_id = state.max_fill_id(self.LAST_BAR_PERSIST_TIMEOUT_S)
-            pos = self.client.fetch_position(self.symbol)
+            pos = self.client.fetch_position_checked(self.symbol)
             snap_side = getattr(self, "_last_position_side", None)
             snap_qty = getattr(self, "_last_position_qty", None)
             if snap_side in (None, "unknown"):
@@ -1140,7 +1155,7 @@ class Bot:
                         and isinstance(prev_wallet, (int, float))
                         and prev_eq and prev_eq > 0):
                     return False
-                residual = float(wallet) - float(prev_wallet)
+                residual = float(wallet) - float(prev_wallet) + booked
                 if residual >= -self.TRANSFER_JUMP_FRAC * prev_eq:
                     return False   # not a withdrawal-sized unexplained drop
             if principal.breached(equity - residual, P, self.kill_fraction):
@@ -1739,15 +1754,14 @@ class Bot:
         except RiskBreach as e:
             self.log.warning("Skipping signal: %s", e)
             return
-        if clamped:
-            self._note_notional_resize(decision.side, intended_qty, intended_notional,
-                                       qty, notional, equity)
-
         # signal_id anchors all 3 legs of this trade on Binance via clientOrderId.
         # Format: snap-v1-<signal_id>-{e|s|t|x|bf|h|k}. Investing-consolidate's
         # importer joins entry+exit fills via this root. ms precision avoids
         # collisions across bot restarts.
         signal_id = str(int(time.time() * 1000))
+        if clamped:
+            self._note_notional_resize(decision.side, intended_qty, intended_notional,
+                                       qty, notional, equity, signal_id=signal_id)
 
         self.log.info(
             "%s %s [%s] sid=%s qty=%.4f price=%.2f sl=%.2f tp=%.2f notional=$%.2f",
@@ -1995,7 +2009,8 @@ class Bot:
 
     def _note_notional_resize(self, side: str, intended_qty: float,
                               intended_notional: float, qty: float,
-                              notional: float, equity: float) -> None:
+                              notional: float, equity: float,
+                              signal_id: str | None = None) -> None:
         """Log + alert a signal resized to MAX_NOTIONAL_USD. Never raises."""
         try:
             frac = (qty / intended_qty) if intended_qty > 0 else 0.0
@@ -2006,16 +2021,25 @@ class Bot:
                    f"effective risk {eff_risk:.2f}% of equity ${equity:,.2f} "
                    f"(target {float(self.risk_pct):.2f}%). Stop/TP prices unchanged.")
             self.log.warning("%s", msg)
+        except Exception:
+            self.log.exception("notional-cap resize note failed")
+            return
+        # separate tries: a ledger/DB failure must not skip the mail
+        try:
             state.record_event("WARN", "signal_resized_notional_cap",
                                {"side": side, "intended_qty": intended_qty,
                                 "intended_notional": intended_notional,
                                 "qty": qty, "notional": notional,
                                 "effective_risk_pct": eff_risk,
-                                "target_risk_pct": float(self.risk_pct)})
+                                "target_risk_pct": float(self.risk_pct)},
+                               signal_id=signal_id)
+        except Exception:
+            self.log.exception("notional-cap resize event failed")
+        try:
             if not self.dry_run:
                 send_alert(f"{self.instance}: entry resized to notional cap", msg)
         except Exception:
-            self.log.exception("notional-cap resize note failed")
+            self.log.exception("notional-cap resize mail failed")
 
     def _entry_blocked(self) -> bool:
         """Fails CLOSED: an unreadable record blocks entries (the safe side)."""
@@ -2149,11 +2173,11 @@ class Bot:
         """Entry row for a fill that never got its stop at entry time. Recorded
         so the ledger pairs it with its close — the old path wrote nothing."""
         state.record_fill(side=side, qty=qty, price=price, reason="entry",
-                          equity_after=equity, client_order_id_root=signal_id)
+                          equity_after=self._ledger_equity(equity), client_order_id_root=signal_id)
         state.enqueue_bot_event(
             "entry", signal_id=signal_id, strategy=self.strategy_name,
             side=side, qty=float(qty), price_usd=float(price),
-            notional_usd=float(qty * price), equity_usd=float(equity),
+            notional_usd=float(qty * price), equity_usd=self._ledger_equity(equity),
             payload={"filled_as": filled_as, "no_stop": True})
 
     def _latest_entry_root_quietly(self) -> str | None:
@@ -2244,9 +2268,15 @@ class Bot:
         write it (record_if_flat=True); if it did, its flat edge records it.
         """
         if not closed:
+            prev = self._pending_record() or {}
+            _o = order or {}
             pending = {"kind": "no_stop_close", "root": root, "side": side,
                        "qty": float(qty), "entry_price": entry_price,
-                       "stop_price": stop_price, "why": why}
+                       "stop_price": stop_price, "why": why,
+                       # sourcery 4657588381: keep the close order, so a later
+                       # confirmed flat prices the close from it (not 0.0)
+                       "close_coid": _o.get("clientOrderId") or prev.get("close_coid"),
+                       "close_order_id": _o.get("id") or prev.get("close_order_id")}
             first = self._pending_record() is None
             # In memory FIRST: if the sqlite write fails this process still
             # retries (a restart then goes through boot(), which flattens).
@@ -2308,8 +2338,70 @@ class Bot:
                        + f"Equity: {_fmt_usd(equity)}\nsignal_id: {root or '(untagged)'}")
         except Exception:
             self.log.exception("no-stop: closed-mail failed")
+        self._watch_emergency_entry(root, side, entry_price, stop_price)
         self._clear_pending()
         self._set_meta_quietly("active_bracket", "")
+
+    def _watch_emergency_entry(self, root: str | None, side: str,
+                               entry_price: float | None,
+                               stop_price: float | None) -> None:
+        """sourcery 4657588356: an episode that ends an emergency / no-stop close
+        (any path) must not leave the root's `-e` entry order unwatched: the root
+        sweep inside the close cancels it without proving it. If it is not proven
+        gone, hand it to the unverified-entry guard (after_emergency_close: no
+        false "filled outside the ledger" mail, entries blocked until proven
+        gone). Runs AFTER the close/flat decision, so it never delays a close.
+        Never raises."""
+        try:
+            if not root or self._unverified_record() is not None:
+                return
+            if self.client.cancel_entry_order(self.symbol, str(root)) is True:
+                return
+            self._set_unverified({
+                "kind": "entry_unverified", "root": str(root), "side": side,
+                "after_emergency_close": True, "since": time.time(),
+                "sl_distance": (abs(float(entry_price) - float(stop_price))
+                                if entry_price and stop_price else 0.0),
+                "tp_distance": 0.0, "place_tp": False, "error": "emergency close"})
+            self.log.warning("no-stop: entry %s not proven gone after the emergency "
+                             "close — guarded", root)
+        except Exception:
+            self.log.exception("no-stop: guarding the entry order failed")
+
+    def _resolve_unverified_after_close(self, u: dict, root: str) -> None:
+        """The guard just finished protecting / emergency-closing a late fill.
+        Clear the record only when the entry order is PROVEN gone; otherwise keep
+        it (marked after_emergency_close so a later flat does not mail a false
+        "closed outside the ledger")."""
+        if self.client.cancel_entry_order(self.symbol, root) is True:
+            self._clear_unverified()
+            return
+        u["after_emergency_close"] = True
+        self._set_unverified(u)
+        self.log.warning("unverified entry %s: closed/protected but the entry order "
+                         "is not proven gone — record kept", root)
+
+    UNVERIFIED_ESCALATE_S = 1800.0
+
+    def _escalate_stuck_unverified(self, u: dict, root: str, why: str) -> None:
+        """A record that cannot be resolved silently blocks entries: after
+        UNVERIFIED_ESCALATE_S say so once at ERROR (one mail)."""
+        if u.get("escalated"):
+            return
+        if "stuck_since" not in u:
+            u["stuck_since"] = time.time()
+            self._set_unverified(u)
+        first = float(u["stuck_since"])
+        if time.time() - first < self.UNVERIFIED_ESCALATE_S:
+            return
+        u["escalated"] = True
+        self._set_unverified(u)
+        self.log.error("unverified entry %s unresolved for %.0f min (%s) — entries "
+                       "stay BLOCKED", root, (time.time() - first) / 60, why)
+        send_alert("Entries BLOCKED — entry order cannot be verified",
+                   f"Entry {root}: {why} for over {self.UNVERIFIED_ESCALATE_S / 60:.0f} "
+                   f"min, so entries stay blocked. Check the entry order and the "
+                   f"position on Binance; the bot keeps checking.")
 
     def _emergency_close(self, pos, root: str | None, equity: float, why: str,
                          stop_price: float | None = None,
@@ -2358,12 +2450,29 @@ class Bot:
             if not self._confirm_flat("no_stop_retry", stop_evidence=False):
                 self._no_stop_next_try = now  # re-check next tick, no backoff
                 return
+            # 4657588356: the `-e` entry order must be proven gone (or watched)
+            # before this episode is forgotten
+            self._watch_emergency_entry(root, side, p.get("entry_price"),
+                                        p.get("stop_price"))
             self._clear_pending()
             if self._newest_fill_is_entry_of(root):
                 try:
-                    state.record_fill(side="close", qty=qty, price=0.0, pnl_usd=None,
-                                      reason="no_stop_close", equity_after=equity,
+                    px = None
+                    if p.get("close_coid") or p.get("close_order_id"):
+                        px = self._resolve_fill_price(
+                            {"clientOrderId": p.get("close_coid"),
+                             "id": p.get("close_order_id")})
+                    pnl = _exit_pnl_usd(side, p.get("entry_price"), px, qty)
+                    state.record_fill(side="close", qty=qty, price=float(px or 0.0),
+                                      pnl_usd=pnl, reason="no_stop_close",
+                                      equity_after=self._ledger_equity(equity),
                                       client_order_id_root=root)
+                    if px:
+                        state.enqueue_bot_event(
+                            "exit", signal_id=root, side=side, qty=float(qty),
+                            price_usd=px, equity_usd=self._ledger_equity(equity),
+                            payload={"reason": "no_stop_close", "exit_price": px,
+                                     "pnl_usd": pnl})
                 except Exception:
                     self.log.exception("no-stop: recording the outside close failed")
             self.log.warning("no-stop retry: position is FLAT — closed outside the "
@@ -2383,7 +2492,19 @@ class Bot:
         latest = self._latest_entry_root_quietly()
         has_row = self._entry_row_exists(root)
         newer_entry = bool(has_row) and latest is not None and str(latest) != str(root)
+        if pos.side == side and abs(pos.qty - qty) > tol and not newer_entry:
+            # sourcery 4657588370: a size mismatch can be OUR residual (the
+            # `-e` fill raced the close and the close used a stale qty). Attribute
+            # it by the entry order's own filled qty before abandoning.
+            filled = self.client.entry_order_filled(self.symbol, str(root))
+            if filled is not None and 0 < pos.qty <= float(filled) + tol:
+                self.log.warning("no-stop retry: residual %.6f is attributable to "
+                                 "entry %s (filled %.6f) — closing it", pos.qty,
+                                 root, filled)
+                qty = float(pos.qty)
         if pos.side != side or abs(pos.qty - qty) > tol or newer_entry:
+            self._watch_emergency_entry(root, side, p.get("entry_price"),
+                                        p.get("stop_price"))
             self._clear_pending()
             self.log.error("no-stop retry ABANDONED: open %s %.4f (latest root %s) is "
                            "not the pending %s %.4f (root %s) — NOT touched",
@@ -2407,7 +2528,7 @@ class Bot:
             coid_root=str(int(time.time() * 1000)))
         if not closed:
             self._finish_no_stop(side, qty, p.get("entry_price"), root, equity,
-                                 closed=False, order=None, close_error=err,
+                                 closed=False, order=order, close_error=err,
                                  why=str(p.get("why") or "pending no-stop close"),
                                  record_if_flat=False, stop_price=p.get("stop_price"))
             return
@@ -2499,13 +2620,20 @@ class Bot:
                 self.log.critical("NO STOP on a partly-attributable %s %.4f (root=%s): "
                                   "%s — NOT closed (not wholly ours)",
                                   pos.side, pos.qty, root, e.sl_error)
+                # sourcery 4657588366: return False so the caller KEEPS its
+                # unverified record and the guard retries the stop every poll;
+                # one alert per root
+                _seen = self.__dict__.setdefault("_mixed_nostop_alerted", set())
+                if root in _seen:
+                    return False
+                _seen.add(root)
                 send_alert("NO STOP — position NOT closed (not wholly the bot's)",
                            f"{pos.side.upper()} {pos.qty:.4f} {self.base_asset} is open, "
                            f"only {float(entry_qty or 0):.4f} of it is attributable to "
                            f"entry {root}, and no stop could be placed: {e.sl_error}.\n"
                            f"Intended stop: {sl_price:,.4f}. The bot does NOT close a "
                            f"position that is not wholly its own. CHECK BINANCE NOW.")
-                return True
+                return False
             self._note_no_stop_entry(e.sl_error)
             self._finish_no_stop(pos.side, pos.qty, pos.entry_price, root, equity,
                                  closed=e.closed, order=e.close_order,
@@ -2623,43 +2751,62 @@ class Bot:
                                  "(%s) — record kept, entries stay blocked", root, seen)
                 return
             if self.client.cancel_entry_order(self.symbol, root) is not True:
+                self._escalate_stuck_unverified(u, root, "the entry order cannot be "
+                                                "proven gone")
                 return
             filled = self.client.entry_order_filled(self.symbol, root)
             tol = max(float(self.constraints.qty_step or 0.0) / 2, 1e-12)
             if filled is None:
                 self.log.warning("unverified entry %s: flat confirmed but the order's "
                                  "filled qty is unreadable — record kept", root)
+                self._escalate_stuck_unverified(u, root, "its filled qty is unreadable")
+                return
+            # H1 (round 4) + sourcery 4657588376: the GTC limit can fill BETWEEN
+            # the strict read above and the cancel, and the order-status read can
+            # lag it. So after EVERY successful cancel re-confirm the position
+            # strictly, whatever `filled` says: open -> protect it now (never clear
+            # and walk away from a naked fill); unknown -> keep the record, retry.
+            try:
+                now_pos = self.client.fetch_position_checked(self.symbol)
+            except Exception as e:
+                self.log.warning("unverified entry %s: filled=%.6f; position "
+                                 "re-read not confirmed (%s) — record kept",
+                                 root, filled, e)
+                return
+            if now_pos.side != "flat" and now_pos.qty:
+                if now_pos.side != u.get("side"):
+                    # sourcery 4657588360: never put this entry's bracket on a
+                    # foreign (opposite-side) position
+                    self._clear_unverified()
+                    send_alert("Entry error — open position is not ours, untouched",
+                               f"Watching entry {root} ({u.get('side')}) but a "
+                               f"{now_pos.side} {now_pos.qty:.4f} position is open "
+                               f"after the cancel. NOT touched. Check Binance.")
+                    return
+                self.log.error("unverified entry %s: FILLED %.6f at the cancel — "
+                               "%s %.6f is OPEN; protecting it", root, filled,
+                               now_pos.side, now_pos.qty)
+                send_alert("Entry error — entry FILLED at cancel, position OPEN",
+                           f"Entry {root} filled {filled:.6f} {self.base_asset} while "
+                           f"the bot was cancelling it; a {now_pos.side} "
+                           f"{now_pos.qty:.6f} position is open. The no-stop rule "
+                           f"now protects it (stop, else close).")
+                ours = now_pos.side == u.get("side") and now_pos.qty <= filled + tol
+                if self._protect_or_close_open(
+                        now_pos, root, float(u["sl_distance"]),
+                        float(u["tp_distance"]), bool(u.get("place_tp", True)),
+                        equity, why="entry order filled at the cancel",
+                        record_if_flat=False, may_close=ours, entry_qty=filled):
+                    self._clear_unverified()
                 return
             if filled > tol:
-                # H1 (round 4): the GTC limit can fill BETWEEN the strict read
-                # above and the cancel. Re-confirm the position before calling
-                # it "flat": open -> protect it now (never clear and walk away
-                # from a naked fill); unknown -> keep the record, retry.
-                try:
-                    now_pos = self.client.fetch_position_checked(self.symbol)
-                except Exception as e:
-                    self.log.warning("unverified entry %s: it FILLED %.6f; position "
-                                     "re-read not confirmed (%s) — record kept",
-                                     root, filled, e)
-                    return
-                if now_pos.side != "flat" and now_pos.qty:
-                    self.log.error("unverified entry %s: FILLED %.6f at the cancel — "
-                                   "%s %.6f is OPEN; protecting it", root, filled,
-                                   now_pos.side, now_pos.qty)
-                    send_alert("Entry error — entry FILLED at cancel, position OPEN",
-                               f"Entry {root} filled {filled:.6f} {self.base_asset} while "
-                               f"the bot was cancelling it; a {now_pos.side} "
-                               f"{now_pos.qty:.6f} position is open. The no-stop rule "
-                               f"now protects it (stop, else close).")
-                    ours = now_pos.side == u.get("side") and now_pos.qty <= filled + tol
-                    if self._protect_or_close_open(
-                            now_pos, root, float(u["sl_distance"]),
-                            float(u["tp_distance"]), bool(u.get("place_tp", True)),
-                            equity, why="entry order filled at the cancel",
-                            record_if_flat=False, may_close=ours, entry_qty=filled):
-                        self._clear_unverified()
-                    return
                 self._clear_unverified()
+                if u.get("after_emergency_close"):
+                    # the bot's own emergency close flattened this fill
+                    self.log.warning("unverified entry %s: filled %.6f, closed by "
+                                     "the bot's emergency close — entry order now "
+                                     "proven gone", root, filled)
+                    return
                 self.log.error("unverified entry %s: it FILLED %.6f but the position "
                                "is now confirmed flat — closed outside the ledger",
                                root, filled)
@@ -2680,7 +2827,7 @@ class Bot:
                     pos, root, float(u["sl_distance"]), float(u["tp_distance"]),
                     bool(u.get("place_tp", True)), equity,
                     why=f"entry raised ({u.get('error')})", record_if_flat=True):
-                self._clear_unverified()
+                self._resolve_unverified_after_close(u, root)
             return
         if pos.side != u.get("side"):
             self._clear_unverified()
@@ -2728,7 +2875,7 @@ class Bot:
                                             f"inside a larger {pos.qty:.4f} position"),
                                        record_if_flat=False, may_close=wholly_ours,
                                        entry_qty=filled):
-            self._clear_unverified()
+            self._resolve_unverified_after_close(u, root)
 
     def _clear_no_stop_records_at_boot(self) -> None:
         """boot() either flattened (sweeping our orders, incl. a resting `-e`)
@@ -3502,17 +3649,27 @@ class Bot:
         else:
             n = 1
         self._flat_seen[site] = (n, seq)
+        unknown = getattr(self, "_flat_unknown_n", None)
+        if unknown is None:
+            unknown = self._flat_unknown_n = {}
         try:
             second = self.client.fetch_position_checked(self.symbol)
         except Exception as e:
             # Never accepted as flat, however long it lasts. Past a few ticks
             # it is ERROR-level, so the monitor's ERROR alert mails it (entries
             # stay blocked while the bracket site is unconfirmed).
-            lvl = logging.ERROR if n >= self.FLAT_UNKNOWN_ERROR_TICKS else logging.WARNING
+            # sourcery 4657590277: an UNKNOWN tick is not a flat observation —
+            # reset the flat streak (flat, unknown, flat must not accept); the
+            # site stays pending.
+            self._flat_seen[site] = (0, seq)
+            unknown[site] = unknown.get(site, 0) + 1
+            lvl = (logging.ERROR if unknown[site] >= self.FLAT_UNKNOWN_ERROR_TICKS
+                   else logging.WARNING)
             self.log.log(lvl, "%s: flat read NOT confirmed — re-read failed (%s); "
                          "treating the position as UNKNOWN, nothing changed "
-                         "(%d consecutive)", site, e, n)
+                         "(%d consecutive)", site, e, unknown[site])
             return False
+        unknown.pop(site, None)
         if second.side != "flat" and second.qty > 0:
             self._flat_clear(site)
             self.log.warning("%s: single FLAT read contradicted by a re-read "
@@ -3532,8 +3689,17 @@ class Bot:
                 # and must not then bypass the debounce.
                 intact = "sl" in legs and (
                     "tp" in legs or not self._tp_was_placed())
+                if "sl" in legs and "tp" not in legs and not intact:
+                    # sourcery 4657584894: a hand-cancelled TP looks the same as
+                    # a filled one. Count it as fill evidence only when the TP's
+                    # own algo status says it triggered; otherwise debounce.
+                    st = self.client.tp_algo_status(self.symbol, self._last_entry_root)
+                    intact = st not in ("FILLED", "FINISHED", "TRIGGERED", "TRIGGERING")
             if intact is False:
                 self._flat_clear(site)
+                # a fill-evidenced flat settles that position: the bot-close
+                # marker must not leak onto a LATER, unrelated close (4657592255)
+                self._bot_close_unconfirmed = None
                 return True
         if n >= self.FLAT_ACCEPT_TICKS:
             self._flat_clear(site)
@@ -3542,6 +3708,8 @@ class Bot:
                        else "algo book unreadable")
                 bc = getattr(self, "_bot_close_unconfirmed", None)
                 self._bot_close_unconfirmed = None
+                if bc and bc.get("root") not in (None, getattr(self, "_last_entry_root", None)):
+                    bc = None   # marker belongs to another position
                 if bc:
                     # F10: the bot's own close, sent earlier but unconfirmed then.
                     self.log.warning("%s: flat confirmed after the bot's %s close "
@@ -3615,7 +3783,7 @@ class Bot:
         self._last_position_qty = qty
         self._last_entry_root = root
 
-    def _detect_bracket_exit(self, equity: float) -> None:
+    def _detect_bracket_exit(self, equity: float, *, flat_confirmed: bool = False) -> None:
         """Bracket SL/TP fills close the position on Binance's side without
         a bot-initiated close. Detect that the tracked position has ENDED and
         emit an exit alert with PnL.
@@ -3680,7 +3848,11 @@ class Bot:
             # there must not sweep it. A genuine flat-edge retry confirms on the
             # fast path anyway (its first pass swept, the algo book is empty).
             if current == "flat" and had_open:
-                if not self._confirm_flat(self.BRACKET_SITE, stop_evidence=True):
+                # flat_confirmed: the caller (HALT / kill) already strictly
+                # confirmed flat, so the debounce would only block the booking
+                # (sourcery 4657592243).
+                if not flat_confirmed and not self._confirm_flat(
+                        self.BRACKET_SITE, stop_evidence=True):
                     return
             else:
                 self._flat_clear(self.BRACKET_SITE)
@@ -4021,7 +4193,7 @@ class Bot:
         state.record_fill(
             side="partial_close", qty=delta, price=price,
             pnl_usd=_exit_pnl_usd(side, basis, price, delta),
-            reason="external_partial", equity_after=equity,
+            reason="external_partial", equity_after=self._ledger_equity(equity),
             client_order_id_root=signal_id)
         self.log.warning("flat edge: recorded pending reduction %.4f @ %.4f",
                          delta, price)
@@ -4142,7 +4314,7 @@ class Bot:
                 state.record_fill(
                     side="partial_add", qty=diff,
                     price=add_px, pnl_usd=None,
-                    reason="external_add", equity_after=equity,
+                    reason="external_add", equity_after=self._ledger_equity(equity),
                     client_order_id_root=prev_root)
             else:
                 delta = -diff
@@ -4174,7 +4346,7 @@ class Bot:
                     state.record_fill(
                         side="partial_close", qty=delta, price=price,
                         pnl_usd=_exit_pnl_usd(pos.side, prev_entry, price, delta),
-                        reason="bot_partial", equity_after=equity,
+                        reason="bot_partial", equity_after=self._ledger_equity(equity),
                         client_order_id_root=prev_root)
                     self._last_position_qty = q
                     self._last_position_entry = float(pos.entry_price)
@@ -4183,7 +4355,7 @@ class Bot:
                 pnl = _exit_pnl_usd(pos.side, prev_entry, price, delta)
                 state.record_fill(
                     side="partial_close", qty=delta, price=price, pnl_usd=pnl,
-                    reason="external_partial", equity_after=equity,
+                    reason="external_partial", equity_after=self._ledger_equity(equity),
                     client_order_id_root=prev_root)
         except Exception as e:
             self._last_position_qty = prev_qty
@@ -4487,6 +4659,13 @@ class Bot:
                                      else "NOT confirmed flat")
                     return
                 exit_price = self._resolve_fill_price(order)
+                if not exit_price:
+                    # sourcery 4657591036: an acknowledged close with no fill price
+                    # (EXPIRED / not attributed) must not be booked at 0.0 — that
+                    # would hide the real SL fill from the flat edge.
+                    self.log.warning("time-stop: close fill price unknown — nothing "
+                                     "recorded; the flat edge records the real exit")
+                    return
                 _entry = self._open_entry_fill()
                 state.record_fill(side="close", qty=pos.qty,
                                   price=float(exit_price or 0.0),
@@ -4575,6 +4754,10 @@ class Bot:
                                  else "NOT confirmed flat")
                 return
             exit_price = self._resolve_fill_price(order)
+            if not exit_price:
+                self.log.warning("trend-exit: close fill price unknown — nothing "
+                                 "recorded; the flat edge records the real exit")
+                return
             _entry = self._open_entry_fill()
             state.record_fill(side="close", qty=pos.qty,
                               price=float(exit_price or 0.0),
@@ -4825,6 +5008,7 @@ class Bot:
     CLOSE_CONFIRM_READS = 2
     CLOSE_CONFIRM_SLEEP_S = 0.5
     CLOSE_FAIL_ALERT_S = 600.0
+    CLOSE_FAIL_RETRY_S = 300.0   # min gap between mail attempts after a FAILED send
 
     def _close_then_sweep(self, root: str | None, close_leg: str,
                           why: str) -> tuple[dict | None, bool]:
@@ -4866,6 +5050,19 @@ class Bot:
                                      f"next pass; check Binance.")
             raise
         flat, last = self._strict_flat_reads()
+        if order is None and not flat and close_leg in ("h", "k"):
+            # sourcery 4657584898: the lenient read saw no position but the strict
+            # read does not confirm flat (e.g. positionRisk has no row while the
+            # account endpoint shows one): HALT/kill must still send a close.
+            try:
+                order = self.client.close_from_account_amt(self.symbol, root, close_leg)
+            except Exception as e:
+                self._alert_close_failed(close_leg, why,
+                                         f"the account-sized reduce-only close RAISED: "
+                                         f"{e!r}. Stops still resting; the bot retries.")
+                raise
+            if order is not None:
+                flat, last = self._strict_flat_reads()
         if order is None:
             # close_position sent NOTHING because its own lenient read said
             # flat — the same single read N1 is about. Sweep nothing here;
@@ -4881,7 +5078,7 @@ class Bot:
             # F10: remember it, so the flat edge that later confirms this
             # position closed says "bot close", not "manual close?".
             self._bot_close_unconfirmed = {"why": why, "leg": close_leg,
-                                           "ts": time.time()}
+                                           "ts": time.time(), "root": root}
             self._alert_close_failed(close_leg, why,
                                      f"the close order was sent but the "
                                      f"position is NOT confirmed flat ({last}). "
@@ -4901,8 +5098,8 @@ class Bot:
 
     def _halt_retry_tick(self, which: str) -> None:
         """G5 (round 3): one HALT retry iteration with flat still unconfirmed.
-        Runs the risk-REDUCING hooks only — the pending no-stop close and
-        reprotect (re-places a missing stop where enabled). No entries, no
+        Runs the risk-REDUCING hooks only — the pending no-stop close, the
+        unverified-entry guard (stop, else close) and reprotect (re-places a missing stop where enabled). No entries, no
         breakeven (it moves stops), no trend/time exits (the HALT close is
         already the exit). Escalates ONCE after HALT_UNCONFIRMED_ESCALATE_S.
         NEVER raises."""
@@ -4915,7 +5112,8 @@ class Bot:
         # stand-in, so nothing may persist it as equity_after (H3).
         self._equity_stale = True
         eq = getattr(self, "_last_known_equity", None)
-        for name in ("_maybe_finish_no_stop_close", "_maybe_reprotect"):
+        for name in ("_maybe_finish_no_stop_close", "_maybe_reprotect",
+                     "_maybe_guard_unverified_entry"):
             try:
                 getattr(self, name)(eq)
             except Exception:
@@ -4936,6 +5134,74 @@ class Bot:
             except Exception:
                 self.log.exception("HALT escalation alert failed")
 
+    def _unverified_entry_blocks_exit(self, why: str) -> bool:
+        """HALT / kill may exit only when no unverified entry order can still
+        fill: with an `entry_unverified` record, require the entry order to be
+        PROVEN gone (cancel_entry_order is True) and a strict flat re-read.
+        Otherwise the caller keeps looping (its close then closes whatever
+        filled). NEVER raises; an unreadable state blocks. Never blocks a close,
+        only the process exit."""
+        try:
+            u = self._unverified_record()
+            if u is None:
+                return False
+            if self.client.cancel_entry_order(self.symbol, str(u.get("root"))) is True \
+                    and self._strict_flat_reads()[0]:
+                return False
+            self.log.error("%s: not exiting — entry %s is unverified (not proven "
+                           "gone / flat); retrying", why, u.get("root"))
+            return True
+        except Exception:
+            self.log.exception("%s: unverified-entry exit check failed", why)
+            return True
+
+    def _ledger_unbooked_exit(self) -> bool | None:
+        """True = newest ledger row is still an entry (exit not booked); False =
+        it is not; None = the ledger could not be read (`_open_entry_fill`
+        swallows its own DB error, so probe the read directly)."""
+        try:
+            with contextlib.closing(sqlite3.connect(state.DB_PATH)) as c:
+                c.execute("SELECT 1 FROM fills LIMIT 1").fetchall()
+        except Exception:
+            return None
+        return self._open_entry_fill() is not None
+
+    def _book_halt_kill_close(self, order: dict | None, reason: str, root: str | None,
+                              equity: float | None) -> None:
+        """A HALT / kill close that was sent AND strictly confirmed flat wrote
+        no close row at all (pre-existing gap, sourcery 4657592243). Book it from
+        the order's own fill price. Falls back to the exchange-trade detector
+        when the price is unknown. NEVER raises: the position is already flat."""
+        try:
+            if order is None:
+                return
+            # Side/qty come from the close order itself (fresh, from this pass):
+            # _last_position_* is stale in the HALT branch (it precedes the tick's
+            # position read) and "unknown" after a boot-time HALT.
+            side = {"sell": "long", "buy": "short"}.get(
+                str(order.get("side") or "").lower())
+            try:
+                qty = float(order.get("amount") or order.get("filled") or 0.0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            entry = self._open_entry_fill()
+            if entry is None:
+                return   # newest row is not an open entry: nothing owed
+            price = self._resolve_fill_price(order)
+            if not price or side is None or qty <= 0:
+                self._detect_bracket_exit(float(equity) if equity is not None
+                                          else float("nan"), flat_confirmed=True)
+                return
+            state.record_fill(side="close", qty=float(qty), price=float(price),
+                              pnl_usd=_exit_pnl_usd(side, entry[2], price, float(qty)),
+                              reason=reason, equity_after=self._ledger_equity(equity),
+                              client_order_id_root=root)
+            state.enqueue_bot_event(
+                "exit", signal_id=root, side=side, qty=float(qty), price_usd=price,
+                equity_usd=self._ledger_equity(equity), payload={"reason": reason})
+        except Exception:
+            self.log.exception("%s: booking the confirmed close failed", reason)
+
     def _exit_found_flat(self, why: str) -> None:
         """G3 (round 3): HALT / kill found the position ALREADY flat (strictly
         confirmed, nothing sent). The process is about to exit, so no later
@@ -4951,7 +5217,8 @@ class Bot:
                 # nothing is known at all (round 4 check of G3).
                 self._equity_stale = True
                 eq = getattr(self, "_last_known_equity", None)
-                self._detect_bracket_exit(float(eq) if eq is not None else float("nan"))
+                self._detect_bracket_exit(float(eq) if eq is not None else float("nan"),
+                                          flat_confirmed=True)
         except Exception:
             self.log.exception("%s: exit detection before exit failed", why)
         n = None
@@ -4959,10 +5226,7 @@ class Bot:
             n = self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
         except Exception:
             self.log.exception("%s: pre-exit sweep failed", why)
-        try:
-            unbooked = self._open_entry_fill() is not None
-        except Exception:
-            unbooked = None
+        unbooked = self._ledger_unbooked_exit()
         msg = (f"{why}: the position was already flat (confirmed) when the bot went "
                f"to close it. Leg orders swept: {n if n is not None else 'FAILED'}. "
                + ("The exit is NOT in the ledger (newest fill is still the entry): "
@@ -4997,14 +5261,36 @@ class Bot:
         sent = getattr(self, "_close_fail_alert_ts", None)
         if sent is None:
             sent = self._close_fail_alert_ts = {}
-        if now - sent.get(close_leg, 0.0) < self.CLOSE_FAIL_ALERT_S:
+        # Throttle persisted in meta (sourcery 4657591044): a raising boot-flatten
+        # close restarts the process every ~10 s, and an in-memory throttle would
+        # mail on every restart.
+        mkey = f"close_fail_alert_ts:{self.instance}:{close_leg}"
+        last = sent.get(close_leg)
+        if last is None:
+            try:
+                last = float(state.get_meta(mkey) or 0.0)
+            except Exception:
+                last = 0.0
+        if now - last < self.CLOSE_FAIL_ALERT_S:
             return
-        sent[close_leg] = now
+        # A FAILED send (SMTP down) must not be retried on every close pass:
+        # each attempt can block up to SMTP_TIMEOUT_S. Short retry throttle,
+        # in memory only; the long throttle above stays success-stamped.
+        tried = getattr(self, "_close_fail_try_ts", None)
+        if tried is None:
+            tried = self._close_fail_try_ts = {}
+        if now - tried.get(close_leg, 0.0) < self.CLOSE_FAIL_RETRY_S:
+            return
+        tried[close_leg] = now
         try:
-            send_alert(f"{self.instance}: bot {why} close FAILED",
-                       f"{why} close of {self.symbol} ({self.instance}): {detail}")
+            ok = send_alert(f"{self.instance}: bot {why} close FAILED",
+                            f"{why} close of {self.symbol} ({self.instance}): {detail}")
         except Exception:
             self.log.exception("close-failed alert could not be sent")
+            return
+        if ok:   # sourcery 4657591040: a failed send must not suppress the retry
+            sent[close_leg] = now
+            self._set_meta_quietly(mkey, repr(now))
 
     def _breakeven_close(self, pos, root: str, be_price: float, mfe: float,
                          equity: float) -> bool:
@@ -5044,6 +5330,10 @@ class Bot:
                              "leaving the exit to _detect_bracket_exit")
             return True
         exit_price = self._resolve_fill_price(order)
+        if not exit_price:
+            self.log.warning("Breakeven: close fill price unknown — nothing "
+                             "recorded; the flat edge records the real exit")
+            return True
         _entry = self._open_entry_fill()
         state.record_fill(side="close", qty=pos.qty, price=float(exit_price or 0.0),
                           pnl_usd=_exit_pnl_usd(pos.side, _entry[2] if _entry else None,
@@ -5089,7 +5379,7 @@ class Bot:
                         except Exception as e:
                             self.log.error("HALT: close raised (%s) — not exiting; "
                                            "retrying", e)
-                            if isinstance(e, ccxt.InvalidNonce):
+                            if is_nonce_error(e):
                                 try:
                                     self.client.ex.load_time_difference()
                                 except Exception as sync_err:
@@ -5099,8 +5389,18 @@ class Bot:
                             transient_backoff_s = min(transient_backoff_s * 2, 30)
                             time.sleep(transient_backoff_s)
                             continue
+                        if halt_flat and self._unverified_entry_blocks_exit(which):
+                            self._halt_retry_tick(which)
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
                         if halt_flat and _o is None:
                             self._exit_found_flat("HALT")   # G3
+                        elif halt_flat:
+                            self._equity_stale = True
+                            self._book_halt_kill_close(
+                                _o, "halt_close", root,
+                                getattr(self, "_last_known_equity", None))
                         if not halt_flat:
                             # F5: do NOT exit while flat is unconfirmed. The
                             # units restart only on-failure, so `return 0` here
@@ -5134,6 +5434,10 @@ class Bot:
                                f"Bot exiting.")
                     return 0
 
+                try:
+                    self._tick_start_principal = principal.get_principal()
+                except Exception:
+                    self._tick_start_principal = None
                 self._maybe_reconcile_principal()
                 equity_known = True
                 self._equity_stale = False
@@ -5171,8 +5475,14 @@ class Bot:
                         # raises → stops kept, alert sent, loop retries (the
                         # kill switch wrote HALT, so the HALT path re-closes)
                         _o, kill_flat = self._close_then_sweep(root, "k", "kill-switch")
+                        if kill_flat and self._unverified_entry_blocks_exit("kill-switch"):
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue   # HALT_<leg> exists: the HALT path retries
                         if kill_flat and _o is None:
                             self._exit_found_flat("kill-switch")   # G3
+                        elif kill_flat:
+                            self._book_halt_kill_close(_o, "kill_close", root, equity)
                         if not kill_flat:
                             # F5: same as HALT — stay alive; HALT_<leg> now
                             # exists, so the next tick's HALT branch retries

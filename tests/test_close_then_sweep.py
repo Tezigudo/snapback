@@ -86,6 +86,7 @@ def test_none_return_on_a_false_flat_sweeps_nothing():
     b, mc = _bot()
     mc.close_position.side_effect = None
     mc.close_position.return_value = None
+    mc.close_from_account_amt.return_value = None   # account flat/unreadable too
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
     with patch("bot.send_alert") as alert:
@@ -418,27 +419,38 @@ def test_halt_retry_runs_risk_reducing_hooks_only_and_escalates():
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
     calls = []
-    b._maybe_finish_no_stop_close = lambda eq: calls.append("no_stop")
+    first_t = []
+    b._maybe_finish_no_stop_close = lambda eq: (calls.append("no_stop"),
+                                                first_t or first_t.append(t[0]))
     b._maybe_reprotect = lambda eq: calls.append("reprotect")
+    b._maybe_guard_unverified_entry = lambda eq: calls.append("guard")
     b._maybe_breakeven = lambda eq: calls.append("breakeven")
     b._maybe_enter = lambda eq: calls.append("enter")
     b._maybe_time_stop = lambda eq: calls.append("time_stop")
     t = [1_000_000.0]
     ticks = {"n": 0}
+    urgent_at = []
 
     def _sleep(_s):
         ticks["n"] += 1
         t[0] += 300.0                                  # 5 min per retry
         if ticks["n"] >= 6:
             b._stopped = True
+    def _alert(subject, *a, **k):
+        if subject.startswith("URGENT"):
+            urgent_at.append(t[0])
     with patch("bot.halt_source", return_value="self"), \
-         patch("bot.send_alert") as alert, patch("bot.time.sleep", side_effect=_sleep), \
+         patch("bot.send_alert", side_effect=_alert) as alert, \
+         patch("bot.time.sleep", side_effect=_sleep), \
          patch("bot.time.time", side_effect=lambda: t[0]):
         b.loop()
-    assert "no_stop" in calls and "reprotect" in calls
+    # every unconfirmed retry ran each hook exactly once (3 ticks: the strict
+    # confirm's own sleep also advances the fake clock)
+    assert calls.count("no_stop") == calls.count("reprotect") == calls.count("guard") == 3
     assert not {"breakeven", "enter", "time_stop"} & set(calls)
-    urgent = [c for c in alert.call_args_list if c.args[0].startswith("URGENT")]
-    assert len(urgent) == 1                            # escalated once, not every tick
+    # escalated ONCE, and not before HALT_UNCONFIRMED_ESCALATE_S elapsed
+    assert len(urgent_at) == 1
+    assert urgent_at[0] >= first_t[0] + b.HALT_UNCONFIRMED_ESCALATE_S
 
 
 # --- G11 (round 3): same-bar held stamp rolled back on an unconfirmed time stop
@@ -582,3 +594,212 @@ def test_exit_found_flat_never_persists_zero_or_stale_equity():
     assert all(c.kwargs.get("equity_usd") is None for c in ev.call_args_list)
     exit_mails = [c.args[1] for c in alert.call_args_list if "exit" in c.args[0].lower()]
     assert exit_mails and "Equity now: $unknown" in exit_mails[0]
+
+
+# --- sourcery 4657592239: HALT/kill must not exit while an entry is unverified
+
+def _flat():
+    return _open("flat", 0.0, 0.0)
+
+
+def _unverified_halt_bot():
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    b._last_position_side = "unknown"
+    b._set_unverified({"kind": "entry_unverified", "root": "r1", "side": "long",
+                       "since": 0.0, "sl_distance": 100.0, "tp_distance": 200.0})
+    return b, mc
+
+
+def test_halt_does_not_exit_while_the_entry_order_is_not_proven_gone():
+    b, mc = _unverified_halt_bot()
+    mc.cancel_entry_order.return_value = None          # cancel unconfirmed
+    ticks = {"n": 0}
+
+    def _sleep(_s):
+        ticks["n"] += 1
+        if ticks["n"] >= 3:
+            b._stopped = True
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        assert b.loop() != 0 or b._stopped is True
+    assert mc.close_position.call_count == 3           # the close is retried each tick
+
+
+def test_halt_exits_once_the_entry_order_is_proven_gone_and_flat():
+    b, mc = _unverified_halt_bot()
+    mc.cancel_entry_order.return_value = True
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.consolidate_push.drain"):
+        assert b.loop() == 0
+
+
+def test_kill_switch_does_not_exit_while_the_entry_order_is_not_proven_gone():
+    b, mc = _unverified_halt_bot()
+    mc.cancel_entry_order.return_value = None          # cancel unconfirmed
+    b._kill_switch_after_reconcile = lambda equity: True
+    mc.fetch_equity_usdt.return_value = 10.0
+
+    def _sleep(_s):
+        if mc.close_position.call_count >= 3:
+            b._stopped = True
+    with patch("bot.halt_source", return_value=None), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        b.loop()
+    assert mc.close_position.call_count >= 3           # retried each pass, never exited
+    assert b._stopped is True                          # left only via the test stop
+
+
+def test_halt_close_raising_a_minus_1021_resyncs_the_clock():
+    # 4657588400: a -1021 that ccxt did not map to InvalidNonce (message only)
+    import ccxt
+    b, mc = _bot()
+    mc.close_position.side_effect = ccxt.ExchangeError(
+        'binanceusdm {"code":-1021,"msg":"Timestamp outside recvWindow"}')
+
+    def _sleep(_s):
+        b._stopped = True
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        b.loop()
+    mc.ex.load_time_difference.assert_called()
+
+
+# --- sourcery 4657592243 / 4657592261 / 4657591036: exit bookkeeping ----------
+
+def _seed_open_long(b):
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+
+
+def _reasons():
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+
+
+def test_halt_found_flat_with_an_intact_bracket_still_books_the_exit():
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    _seed_open_long(b)
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    # bracket fully intact: the debounce alone would never book on this tick
+    mc.fetch_algo_orders.side_effect = None
+    # reduceOnly: without it algo_bracket_leg returns None for these rows and
+    # the "intact" bracket would read as SL-gone fill evidence (4657592243)
+    mc.fetch_algo_orders.return_value = (
+        [{"clientAlgoId": "snap-v1-r1-s", "reduceOnly": True},
+         {"clientAlgoId": "snap-v1-r1-t", "reduceOnly": True}], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.consolidate_push"):
+        assert b.loop() == 0
+    assert _reasons() == ["entry", "bracket_exit"]
+
+
+def test_halt_close_sent_and_confirmed_books_a_halt_close_row():
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    _seed_open_long(b)
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1", "average": 64_500.0,
+                                      "side": "sell", "amount": 0.01}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.consolidate_push"):
+        assert b.loop() == 0
+    assert _reasons() == ["entry", "halt_close"]
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        px, pnl, eq = c.execute("SELECT price, pnl_usd, equity_after FROM fills "
+                                "WHERE reason='halt_close'").fetchone()
+    assert px == 64_500.0 and pnl == pytest.approx(-5.0) and eq is None
+
+
+def test_found_flat_mail_says_unreadable_when_the_ledger_cannot_be_read():
+    b, mc = _bot()
+    _seed_open_long(b)
+    b._last_position_side = "flat"          # skip the detector
+    with patch("bot.sqlite3.connect", side_effect=RuntimeError("db locked")), \
+         patch("bot.send_alert") as alert:
+        b._exit_found_flat("HALT")
+    body = alert.call_args.args[1]
+    assert "unreadable" in body and "recorded" not in body.replace("unreadable", "")
+
+
+def test_time_stop_close_with_unknown_fill_price_books_nothing():
+    b, mc = _time_stop_bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"average": 0.0}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("flat", 0.0, 0.0)
+    b._resolve_fill_price = lambda order: None
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
+        b._maybe_time_stop(equity=1000.0)
+    assert "time_stop" not in _reasons()
+
+
+def test_halt_sends_an_account_sized_reduce_only_close_when_positionrisk_has_no_row():
+    # sourcery 4657584898
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None              # lenient read: no row
+    mc.close_from_account_amt.return_value = {"id": "9"}
+    mc.fetch_position_checked.side_effect = lambda *a, **k: (
+        _open("flat", 0.0, 0.0) if mc.close_from_account_amt.called
+        else _open("long", 65_000.0, 0.01))
+    order, flat = b._close_then_sweep("r1", "h", "HALT")
+    mc.close_from_account_amt.assert_called_once()
+    assert order == {"id": "9"}
+
+
+def test_client_close_from_account_amt_is_reduce_only_and_signed():
+    from exchange.binance_client import BinanceClient
+    ex = MagicMock()
+    ex.market.return_value = {"id": "BTCUSDT"}
+    ex.fapiPrivateV2GetAccount.return_value = {
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "-0.010"}]}
+    ex.create_order.return_value = {"id": "1"}
+    c = BinanceClient(ex=ex, env="testnet", coid_prefix="snap-v1-")
+    c.close_from_account_amt("BTC/USDT:USDT", "r1", "h")
+    args = ex.create_order.call_args.args
+    assert args[2] == "buy" and args[3] == 0.01
+    assert ex.create_order.call_args.args[-1]["reduceOnly"] is True \
+        if len(args) > 5 else ex.create_order.call_args.kwargs["params"]["reduceOnly"]
+
+
+def test_strict_confirm_sits_between_the_close_and_the_sweep():
+    # sourcery 4657591048
+    b, mc = _bot()
+    parent = MagicMock()
+    parent.attach_mock(mc.close_position, "close_position")
+    parent.attach_mock(mc.fetch_position_checked, "fetch_position_checked")
+    parent.attach_mock(mc.cancel_open_orders, "cancel_open_orders")
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("flat", 0.0, 0.0)
+    with patch("bot.send_alert"):
+        b._close_then_sweep("r1", "x", "time-stop")
+    names = [c[0] for c in parent.mock_calls]
+    assert names == ["close_position", "fetch_position_checked", "cancel_open_orders"]
+
+
+def test_lenient_flat_with_unknown_strict_read_sweeps_nothing():
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position.return_value = _open("flat", 0.0, 0.0)       # lenient: flat
+    mc.fetch_position_checked.side_effect = PositionUnknown("garbled")
+    with patch("bot.send_alert"):
+        order, flat = b._close_then_sweep("r1", "x", "time-stop")
+    assert flat is False
+    mc.cancel_open_orders.assert_not_called()

@@ -348,7 +348,11 @@ class BinanceClient:
         the V2 account positions array, which lists every symbol including
         zero ones). Zero there → flat; non-zero → PositionUnknown (the two
         endpoints disagree); unreadable → PositionUnknown. An explicit row with
-        contracts == 0 is a positive "flat" from positionRisk itself.
+        contracts == 0 is ALSO cross-checked (V3 returns zero rows whenever
+        orders rest, i.e. exactly at the bracket flat edge): non-zero account →
+        PositionUnknown, but an unreadable account endpoint keeps that explicit
+        flat, so an account outage is not a total entry block.
+        Account endpoint: V2 then V3; under V3 an absent row is unknown, not flat.
         """
         positions = self.ex.fetch_positions([symbol])
         if not isinstance(positions, list):
@@ -377,20 +381,20 @@ class BinanceClient:
                 unrealized_pnl=float(p.get("unrealizedPnl") or 0.0),
                 margin_used=float(p.get("initialMargin") or 0.0),
             )
+        amt = self._account_position_amt(symbol)
+        if amt is not None and amt > 0:
+            raise PositionUnknown(
+                f"positionRisk reads {symbol} flat but the account endpoint "
+                f"shows |positionAmt|={amt}")
         if not seen_row:
-            amt = self._account_position_amt(symbol)
             if amt is None:
                 raise PositionUnknown(
                     f"positionRisk has no {symbol} row and the account endpoint "
                     f"could not confirm flat")
-            if amt > 0:
-                raise PositionUnknown(
-                    f"positionRisk has no {symbol} row but the account endpoint "
-                    f"shows |positionAmt|={amt}")
         return Position(symbol=symbol, side="flat", qty=0.0,
                         entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
 
-    def _account_position_amt(self, symbol: str) -> float | None:
+    def _account_position_amt(self, symbol: str, signed: bool = False) -> float | None:
         """Sum of |positionAmt| for `symbol` from the futures ACCOUNT endpoint —
         independent of positionRisk. None = cannot vouch.
 
@@ -415,12 +419,13 @@ class BinanceClient:
             except Exception as e:
                 log.warning("account endpoint %s read failed: %s", name, e)
                 continue
-            amt = self._amt_from_account(acct, symbol)
+            amt = self._amt_from_account(acct, symbol, signed)
             if amt is not None:
                 return amt
         return None
 
-    def _amt_from_account(self, acct: Any, symbol: str) -> float | None:
+    def _amt_from_account(self, acct: Any, symbol: str,
+                          signed: bool = False) -> float | None:
         rows = acct.get("positions") if isinstance(acct, dict) else None
         if not isinstance(rows, list):
             return None
@@ -436,7 +441,7 @@ class BinanceClient:
             if not math.isfinite(amt):
                 return None
             matched = True
-            total += abs(amt)
+            total += amt if signed else abs(amt)
         return total if matched else None
 
     # --- order management ---------------------------------------------------
@@ -533,7 +538,28 @@ class BinanceClient:
         if not isinstance(rows, list):
             log.warning("openAlgoOrders returned %s, not a list", type(rows).__name__)
             return [], False
+        if not all(isinstance(r, dict) for r in rows):
+            # a malformed row would raise in every classifier; "unreadable"
+            # already defers (sourcery 4657590284)
+            log.warning("openAlgoOrders returned a non-dict row — book unreadable")
+            return [], False
         return rows, True
+
+    def tp_algo_status(self, symbol: str, root: str | None) -> str | None:
+        """algoStatus (upper-case) of this root's TP algo order, looked up by
+        clientAlgoId; None = unreadable / not found. One read; used only on the
+        flat edge, to tell a TP FILL from a hand-cancelled TP."""
+        coid = _coid(root, "t", self.coid_prefix)
+        fetch = getattr(self.ex, "fapiPrivateGetAlgoOrder", None)
+        if coid is None or fetch is None:
+            return None
+        try:
+            row = fetch({"clientAlgoId": coid})
+        except Exception as e:
+            log.warning("algo order %s status read failed: %s", coid, e)
+            return None
+        st = row.get("algoStatus") if isinstance(row, dict) else None
+        return str(st).upper() if st else None
 
     def _cancel_algo_orders(self, symbol: str, coid_prefix: str | None) -> int | None:
         """Sweep resting algo/conditional trigger orders (raw fapi endpoints).
@@ -1434,6 +1460,28 @@ class BinanceClient:
             params["positionSide"] = pos_side
         return self._create_order_with_coid_retry(
             symbol, "market", ccxt_side, p.qty, None, params)
+
+    def close_from_account_amt(self, symbol: str, client_order_id_root: str | None,
+                               close_leg: str) -> dict[str, Any] | None:
+        """HALT/kill fallback (sourcery 4657584898): positionRisk showed no
+        usable row (so close_position sent nothing) while the independent
+        ACCOUNT endpoint shows a position. Send a REDUCE-ONLY market close sized
+        from the signed account amount; reduce-only means a wrong side is
+        rejected, never opened. None = account flat or unreadable.
+        One-way mode only: in hedge mode the order needs a positionSide and the
+        signed account amounts of two legs cannot be summed, so it REFUSES
+        (raises) rather than send a request that is rejected on every loop."""
+        if self.hedge_mode:
+            raise RuntimeError("close_from_account_amt: hedge mode is not supported "
+                               "(positionSide needed) — close the position manually")
+        amt = self._account_position_amt(symbol, signed=True)
+        if not amt:
+            return None
+        params: dict[str, Any] = {"reduceOnly": True}
+        if (coid := _coid(client_order_id_root, close_leg, self.coid_prefix)):
+            params["newClientOrderId"] = coid
+        return self._create_order_with_coid_retry(
+            symbol, "market", "sell" if amt > 0 else "buy", abs(amt), None, params)
 
     def __repr__(self) -> str:
         return f"BinanceClient(env={self.env!r}, api_key='***')"
