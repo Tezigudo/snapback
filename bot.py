@@ -2155,11 +2155,11 @@ class Bot:
         """Entry row for a fill that never got its stop at entry time. Recorded
         so the ledger pairs it with its close — the old path wrote nothing."""
         state.record_fill(side=side, qty=qty, price=price, reason="entry",
-                          equity_after=equity, client_order_id_root=signal_id)
+                          equity_after=self._ledger_equity(equity), client_order_id_root=signal_id)
         state.enqueue_bot_event(
             "entry", signal_id=signal_id, strategy=self.strategy_name,
             side=side, qty=float(qty), price_usd=float(price),
-            notional_usd=float(qty * price), equity_usd=float(equity),
+            notional_usd=float(qty * price), equity_usd=self._ledger_equity(equity),
             payload={"filled_as": filled_as, "no_stop": True})
 
     def _latest_entry_root_quietly(self) -> str | None:
@@ -4102,7 +4102,7 @@ class Bot:
         state.record_fill(
             side="partial_close", qty=delta, price=price,
             pnl_usd=_exit_pnl_usd(side, basis, price, delta),
-            reason="external_partial", equity_after=equity,
+            reason="external_partial", equity_after=self._ledger_equity(equity),
             client_order_id_root=signal_id)
         self.log.warning("flat edge: recorded pending reduction %.4f @ %.4f",
                          delta, price)
@@ -4223,7 +4223,7 @@ class Bot:
                 state.record_fill(
                     side="partial_add", qty=diff,
                     price=add_px, pnl_usd=None,
-                    reason="external_add", equity_after=equity,
+                    reason="external_add", equity_after=self._ledger_equity(equity),
                     client_order_id_root=prev_root)
             else:
                 delta = -diff
@@ -4255,7 +4255,7 @@ class Bot:
                     state.record_fill(
                         side="partial_close", qty=delta, price=price,
                         pnl_usd=_exit_pnl_usd(pos.side, prev_entry, price, delta),
-                        reason="bot_partial", equity_after=equity,
+                        reason="bot_partial", equity_after=self._ledger_equity(equity),
                         client_order_id_root=prev_root)
                     self._last_position_qty = q
                     self._last_position_entry = float(pos.entry_price)
@@ -4264,7 +4264,7 @@ class Bot:
                 pnl = _exit_pnl_usd(pos.side, prev_entry, price, delta)
                 state.record_fill(
                     side="partial_close", qty=delta, price=price, pnl_usd=pnl,
-                    reason="external_partial", equity_after=equity,
+                    reason="external_partial", equity_after=self._ledger_equity(equity),
                     client_order_id_root=prev_root)
         except Exception as e:
             self._last_position_qty = prev_qty

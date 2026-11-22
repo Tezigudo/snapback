@@ -153,3 +153,19 @@ def test_unproven_entry_cancel_after_emergency_close_rearms_the_guard():
     u = b._unverified_record()
     assert u and u["root"] == "r1" and u["after_emergency_close"] is True
     assert b._pending_record() is None
+
+
+# --- stale equity (4657588390) -------------------------------------------------
+
+@pytest.mark.parametrize("equity,stale", [(None, False), (1000.0, True)])
+def test_entry_row_is_written_with_null_equity_when_equity_is_unknown_or_stale(equity, stale):
+    import sqlite3
+
+    from exchange import state
+    b, mc = _make_bot()
+    b._equity_stale = stale
+    b._record_entry_fill("long", 0.01, 65_000.0, "r1", equity, "market")
+    with sqlite3.connect(state.DB_PATH) as c:
+        rows = c.execute("SELECT reason, equity_after FROM fills").fetchall()
+    assert rows == [("entry", None)]
+
