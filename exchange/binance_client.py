@@ -391,18 +391,36 @@ class BinanceClient:
                         entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
 
     def _account_position_amt(self, symbol: str) -> float | None:
-        """Sum of |positionAmt| for `symbol` from GET /fapi/v2/account — an
-        endpoint independent of positionRisk. None when it cannot vouch: no
-        such ccxt method, the call fails, an unexpected shape, or no row for
-        the symbol (V2 lists every symbol, so a missing row is not "flat")."""
-        fetch = getattr(self.ex, "fapiPrivateV2GetAccount", None)
-        if fetch is None:
-            return None
-        try:
-            acct = fetch()
-        except Exception as e:
-            log.warning("account endpoint read failed: %s", e)
-            return None
+        """Sum of |positionAmt| for `symbol` from the futures ACCOUNT endpoint —
+        independent of positionRisk. None = cannot vouch.
+
+        Endpoint (G10, checked against installed ccxt 4.5.54, whose implicit
+        API lists both `fapiPrivateV2GetAccount` and `fapiPrivateV3GetAccount`
+        with no deprecation marker): GET /fapi/v2/account, request WEIGHT 5
+        per Binance's docs (ccxt's internal `cost: 1` is its own throttle unit,
+        not the exchange weight). V2 lists EVERY symbol, zero ones included,
+        so a missing row means "cannot vouch", not "flat".
+        Fallback when V2 is missing or fails: GET /fapi/v3/account (also weight
+        5). V3 lists only symbols with a position or open orders, so there a
+        PRESENT row with positionAmt 0 confirms flat but an ABSENT row is
+        still None — fail-safe (entries stay blocked and G4 escalates) if V2
+        ever disappears.
+        """
+        for name in ("fapiPrivateV2GetAccount", "fapiPrivateV3GetAccount"):
+            fetch = getattr(self.ex, name, None)
+            if fetch is None:
+                continue
+            try:
+                acct = fetch()
+            except Exception as e:
+                log.warning("account endpoint %s read failed: %s", name, e)
+                continue
+            amt = self._amt_from_account(acct, symbol)
+            if amt is not None:
+                return amt
+        return None
+
+    def _amt_from_account(self, acct: Any, symbol: str) -> float | None:
         rows = acct.get("positions") if isinstance(acct, dict) else None
         if not isinstance(rows, list):
             return None
