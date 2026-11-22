@@ -439,3 +439,40 @@ def test_halt_retry_runs_risk_reducing_hooks_only_and_escalates():
     assert not {"breakeven", "enter", "time_stop"} & set(calls)
     urgent = [c for c in alert.call_args_list if c.args[0].startswith("URGENT")]
     assert len(urgent) == 1                            # escalated once, not every tick
+
+
+# --- G11 (round 3): same-bar held stamp rolled back on an unconfirmed time stop
+
+def _same_bar_time_stop_bot(strategy):
+    b, mc = _time_stop_bot()
+    b.strategy_name = strategy
+    b.bar_seconds = 3600
+    return b, mc
+
+
+def test_unconfirmed_time_stop_rolls_back_the_same_bar_stamp():
+    from bot_internals import _TIME_STOP_REENTERS_SAME_BAR
+    strat = sorted(_TIME_STOP_REENTERS_SAME_BAR)[0]
+    b, mc = _same_bar_time_stop_bot(strat)
+    b._position_held_at = None
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    now = 1_800_000_000.0 + 1800                       # mid-bar
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True), \
+         patch("bot.time.time", return_value=now):
+        b._maybe_time_stop(equity=1000.0)
+    assert b._position_held_at == now                  # held NOW, not bar_open - 1
+
+
+def test_confirmed_time_stop_keeps_the_same_bar_stamp():
+    from bot_internals import _TIME_STOP_REENTERS_SAME_BAR
+    strat = sorted(_TIME_STOP_REENTERS_SAME_BAR)[0]
+    b, _mc = _same_bar_time_stop_bot(strat)
+    b._position_held_at = None
+    now = 1_800_000_000.0 + 1800
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True), \
+         patch("bot.time.time", return_value=now):
+        b._maybe_time_stop(equity=1000.0)
+    assert b._position_held_at == (int(now) // 3600) * 3600 - 1
