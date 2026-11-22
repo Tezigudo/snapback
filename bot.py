@@ -3255,6 +3255,7 @@ class Bot:
     # so nothing would put the stop back. A flat that the bot is about to ACT
     # on must now be confirmed.
     FLAT_ACCEPT_TICKS = 2      # consecutive flat ticks that accept a flat with no fill evidence
+    FLAT_UNKNOWN_ERROR_TICKS = 5  # unreadable re-reads in a row before it logs ERROR
     BRACKET_SITE = "bracket_exit"
 
     def _flat_pending(self, site: str) -> bool:
@@ -3292,9 +3293,13 @@ class Bot:
         try:
             second = self.client.fetch_position_checked(self.symbol)
         except Exception as e:
-            self.log.warning("%s: flat read NOT confirmed — re-read failed (%s); "
-                             "treating the position as UNKNOWN, nothing changed "
-                             "(%d/%d)", site, e, n, self.FLAT_ACCEPT_TICKS)
+            # Never accepted as flat, however long it lasts. Past a few ticks
+            # it is ERROR-level, so the monitor's ERROR alert mails it (entries
+            # stay blocked while the bracket site is unconfirmed).
+            lvl = logging.ERROR if n >= self.FLAT_UNKNOWN_ERROR_TICKS else logging.WARNING
+            self.log.log(lvl, "%s: flat read NOT confirmed — re-read failed (%s); "
+                         "treating the position as UNKNOWN, nothing changed "
+                         "(%d consecutive)", site, e, n)
             return False
         if second.side != "flat" and second.qty > 0:
             self._flat_clear(site)
@@ -3439,11 +3444,13 @@ class Bot:
             # "unknown" would make the next tick a silent "first observation"
             # and drop a real exit (the 2026-09-04 failure). It also must not
             # reset the _ext_pending debounce below. Not a retry either: it
-            # never touches _exit_retry_n. A retry of an exit that was already
-            # confirmed (_exit_retry_n > 0) has swept already and skips this.
+            # never touches _exit_retry_n. Retries are confirmed too — NO
+            # bypass: a pending REPLACEMENT retry restores the OLD snapshot
+            # while a fresh bracket protects the new position, so a false flat
+            # there must not sweep it. A genuine flat-edge retry confirms on the
+            # fast path anyway (its first pass swept, the algo book is empty).
             if current == "flat" and had_open:
-                if self._exit_retry_n == 0 and not self._confirm_flat(
-                        self.BRACKET_SITE, stop_evidence=True):
+                if not self._confirm_flat(self.BRACKET_SITE, stop_evidence=True):
                     return
             else:
                 self._flat_clear(self.BRACKET_SITE)

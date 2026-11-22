@@ -134,12 +134,40 @@ def test_flat_then_open_resets_the_debounce():
     _assert_untouched(b, mc)
 
 
-def test_retry_of_an_already_confirmed_exit_skips_confirmation():
+def test_retry_of_an_already_swept_exit_still_confirms_on_the_fast_path():
+    """A flat-edge retry (first pass swept, lookup failed) re-confirms: the
+    algo book is empty, so it records on the same tick."""
     b, mc = _bot()
-    b._exit_retry_n = 1  # the edge was confirmed and swept on an earlier tick
-    mc.fetch_position_checked.side_effect = AssertionError("must not re-confirm")
+    b._exit_retry_n = 1
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([], True)
     _tick(b)
     assert _fills() == ["entry", "bracket_exit"]
+    mc.fetch_position_checked.assert_called_once()
+
+
+def test_pending_replacement_retry_is_not_swept_on_a_false_flat():
+    """Replacement retry pending (_exit_retry_n=1, snapshot = OLD position) and
+    the REPLACEMENT position carries a fresh bracket. One false flat read must
+    not strip it, nor book a bracket_exit off the replacement's entry row."""
+    b, mc = _bot()
+    b._exit_retry_n = 1
+    mc.fetch_position_checked.return_value = _open("long", 66_000.0, QTY)
+    _tick(b)
+    mc.cancel_open_orders.assert_not_called()
+    assert _fills() == ["entry"]
+
+
+def test_persistently_unreadable_reread_escalates_to_error(caplog):
+    import logging
+    b, mc = _bot()
+    mc.fetch_position_checked.side_effect = PositionUnknown("no contracts")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(b.FLAT_UNKNOWN_ERROR_TICKS):
+            _tick(b)
+    assert any(r.levelno == logging.ERROR and "NOT confirmed" in r.getMessage()
+               for r in caplog.records)
+    _assert_untouched(b, mc)
 
 
 # --- no-stop retry site -------------------------------------------------------
