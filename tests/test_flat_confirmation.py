@@ -204,9 +204,44 @@ def _client(payload):
     return BinanceClient(ex=ex, env="testnet", coid_prefix="snap-v1-")
 
 
-def test_checked_read_flat_on_empty_list():
-    # V3 positionRisk omits flat symbols: empty IS the normal flat answer
-    assert _client([]).fetch_position_checked("BTC/USDT:USDT").side == "flat"
+def _acct(ex, rows):
+    ex.fapiPrivateV2GetAccount.return_value = {"positions": rows}
+
+
+def test_empty_list_is_flat_only_if_the_account_endpoint_confirms():
+    # V3 positionRisk omits flat symbols; the INDEPENDENT account endpoint
+    # (fapi v2 account, lists every symbol) must say positionAmt == 0 (F8)
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0.000"},
+                 {"symbol": "ETHUSDT", "positionAmt": "1.0"}])
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+
+
+@pytest.mark.parametrize("acct", [
+    "raises", "no-method", "no-row", "nonzero", "garbage",
+], ids=lambda a: a)
+def test_empty_list_without_independent_confirmation_is_unknown(acct):
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    if acct == "raises":
+        c.ex.fapiPrivateV2GetAccount.side_effect = RuntimeError("timeout")
+    elif acct == "no-method":
+        del c.ex.fapiPrivateV2GetAccount
+    elif acct == "no-row":
+        _acct(c.ex, [{"symbol": "ETHUSDT", "positionAmt": "0"}])
+    elif acct == "nonzero":   # positionRisk stale-empty, account shows the position
+        _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0.010"}])
+    else:
+        _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "abc"}])
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+
+
+def test_explicit_zero_row_is_flat_without_the_account_read():
+    c = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.0, "side": "long"}])
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+    c.ex.fapiPrivateV2GetAccount.assert_not_called()
 
 
 @pytest.mark.parametrize("payload", [
