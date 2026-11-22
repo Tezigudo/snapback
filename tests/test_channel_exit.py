@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -257,6 +259,7 @@ def _mock_client() -> MagicMock:
     # "readable, and empty" so these tests keep describing the PLAIN book only —
     # a bare MagicMock here would be iterated as if it were rows.
     mc.fetch_algo_orders.return_value = ([], True)
+    agree_on_flat(mc, set_algo=False)
     return mc
 
 
@@ -551,7 +554,12 @@ class TestMaybeReprotect:
     def test_clears_stale_meta_when_flat(self):
         bot, mc = self._bot()
         mc.fetch_position.return_value = _flat()
-        with patch("bot.state.set_meta") as set_meta:
+        with patch("bot.state.get_meta", return_value=_ACTIVE_BRACKET), \
+             patch("bot.state.set_meta") as set_meta:
+            # 2026-11 (N1): one flat tick is unconfirmed — the record stays
+            bot._maybe_reprotect(equity=10000.0)
+            set_meta.assert_not_called()
+            # the flat persists on the next tick: confirmed, record dropped
             bot._maybe_reprotect(equity=10000.0)
         set_meta.assert_called_once_with("active_bracket", "")
         mc._place_brackets.assert_not_called()

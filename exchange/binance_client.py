@@ -59,6 +59,11 @@ def _coid(root: str | None, leg: str, prefix: str = _COID_PREFIX_DEFAULT) -> str
     return coid if _COID_VALID.fullmatch(coid) else None
 
 
+class PositionUnknown(RuntimeError):
+    """Position payload unreadable — neither "open" nor "flat" can be claimed.
+    Deliberately NOT a ccxt error (same reason as EquityUnavailable)."""
+
+
 class EquityUnavailable(RuntimeError):
     """Balance payload unreadable. Deliberately NOT a ccxt error, so the loop's
     NetworkError clause cannot swallow it; callers treat it as "unknown"."""
@@ -312,6 +317,50 @@ class BinanceClient:
             if p.get("symbol") != symbol:
                 continue
             qty = float(p.get("contracts") or 0.0)
+            if qty == 0:
+                continue
+            side = "long" if (p.get("side") or "").lower() == "long" else "short"
+            return Position(
+                symbol=symbol, side=side, qty=abs(qty),
+                entry_price=float(p.get("entryPrice") or 0.0),
+                unrealized_pnl=float(p.get("unrealizedPnl") or 0.0),
+                margin_used=float(p.get("initialMargin") or 0.0),
+            )
+        return Position(symbol=symbol, side="flat", qty=0.0,
+                        entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
+
+    def fetch_position_checked(self, symbol: str) -> Position:
+        """`fetch_position`, but a payload it cannot vouch for is UNKNOWN.
+
+        Used ONLY to CONFIRM a flat read before the bot acts on it (cancelling
+        a stop, erasing `active_bracket`, clearing a pending no-stop close).
+        `fetch_position` folds every odd payload into "flat" — a non-list, a
+        row for our symbol with a missing / non-numeric `contracts` — and the
+        flat-edge sweep used to strip a live position's stop on one such read
+        (2026-11 review, N1). This raises `PositionUnknown` instead.
+
+        An EMPTY list is NOT unknown: ccxt's default positionRisk is the V3
+        endpoint, which omits symbols with no position and no open orders, so
+        an empty list is Binance's ordinary "flat". The bot's defence against a
+        stale-but-well-formed empty answer is the cross-tick debounce and the
+        resting-stop check in `Bot._confirm_flat`, not this method.
+        """
+        positions = self.ex.fetch_positions([symbol])
+        if not isinstance(positions, list):
+            raise PositionUnknown(
+                f"fetch_positions returned {type(positions).__name__}, not a list")
+        for p in positions:
+            if not isinstance(p, dict) or p.get("symbol") != symbol:
+                continue
+            raw = p.get("contracts")
+            if raw is None:
+                raise PositionUnknown(f"{symbol} row has no 'contracts' field")
+            try:
+                qty = float(raw)
+            except (TypeError, ValueError) as e:
+                raise PositionUnknown(f"{symbol} contracts={raw!r}") from e
+            if not math.isfinite(qty):
+                raise PositionUnknown(f"{symbol} contracts={raw!r}")
             if qty == 0:
                 continue
             side = "long" if (p.get("side") or "").lower() == "long" else "short"

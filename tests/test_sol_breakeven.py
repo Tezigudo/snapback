@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 import ccxt
 import pandas as pd
 import pytest
@@ -173,6 +175,7 @@ def _bot(params: dict | None = None, dry_run: bool = False):
     mc.cancel_algo_by_coid.return_value = True
     mc.fetch_mark_price.return_value = 111.0
     mc.fetch_position.return_value = Position("SOL/USDT:USDT", "long", QTY, ENTRY, 5.0, 20.0)
+    agree_on_flat(mc, set_algo=False)
     with patch("bot.BinanceClient.from_env", return_value=mc):
         bot = Bot(params=params or PARAMS, dry_run=dry_run, instance="sol_supertrend")
     return bot, mc

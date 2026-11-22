@@ -35,12 +35,14 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 try:
@@ -227,10 +229,47 @@ def _heartbeat_age_s(path: Path) -> int | None:
     return int(dt.datetime.now().timestamp() - path.stat().st_mtime)
 
 
-def _count_log_events(log_path: Path, since_offset: int, patterns: dict[str, str]) -> tuple[dict[str, int], int]:
+_ALERT_LEVELS = frozenset({"ERROR", "CRITICAL"})
+_LEVEL_RE = re.compile(r'"level"\s*:\s*"([A-Z]+)"')
+
+
+def _line_level(line: str) -> str | None:
+    """Return the `level` field of one bot log line, or None.
+
+    The bot's JsonFormatter writes `json.dumps(payload)`, i.e. `"level": "ERROR"`
+    WITH a space after the colon. The old substring needle `'"level":"ERROR"'`
+    therefore never matched and the ERROR alert could not fire (found 2026-11).
+    Parse the JSON line; fall back to a whitespace-tolerant regex for a line
+    that is not valid JSON (partial write at EOF, hand-edited log).
+    """
+    stripped = line.strip()
+    if stripped.startswith("{"):
+        try:
+            obj = json.loads(stripped)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            lvl = obj.get("level")
+            return str(lvl).upper() if lvl is not None else None
+    m = _LEVEL_RE.search(line)
+    return m.group(1) if m else None
+
+
+def _is_alert_level(line: str) -> bool:
+    """True for an ERROR or CRITICAL bot log line."""
+    return _line_level(line) in _ALERT_LEVELS
+
+
+def _count_log_events(
+    log_path: Path,
+    since_offset: int,
+    patterns: dict[str, str | Callable[[str], bool]],
+) -> tuple[dict[str, int], int]:
     """Scan log file from `since_offset` to EOF. Returns (per-pattern counts, new offset).
 
-    Patterns is {kind: substring}. A line counts if substring is present.
+    Patterns is {kind: substring | predicate}. A line counts if the substring is
+    present, or if the predicate returns True for it. Use a predicate (not a
+    substring) for anything keyed on JSON structure — see `_line_level`.
     """
     counts = {k: 0 for k in patterns}
     if not log_path.exists():
@@ -246,7 +285,8 @@ def _count_log_events(log_path: Path, since_offset: int, patterns: dict[str, str
         text = data.decode("utf-8", errors="replace")
         for line in text.splitlines():
             for kind, needle in patterns.items():
-                if needle in line:
+                hit = needle(line) if callable(needle) else needle in line
+                if hit:
                     counts[kind] += 1
         return counts, new_offset
     except OSError as e:
@@ -728,7 +768,7 @@ def _check_leg(leg: dict[str, str], cfg: dict[str, Any], state: dict[str, Any]) 
     counts, new_offset = _count_log_events(
         log_path, since,
         {
-            "ERROR":      '"level":"ERROR"',
+            "ERROR":      _is_alert_level,   # ERROR + CRITICAL, JSON-parsed
             "TRACEBACK":  "Traceback (most recent call last)",
             "NAN_4H":     "mtf_4h_gate_nan",
             "KILL_SWITCH":"KILL SWITCH",
@@ -739,7 +779,7 @@ def _check_leg(leg: dict[str, str], cfg: dict[str, Any], state: dict[str, Any]) 
     if counts["ERROR"] > 0 and cfg.get("error_alert"):
         _emit(
             f"ERROR x{counts['ERROR']}: {name}",
-            f"{counts['ERROR']} ERROR-level events in {log_path.name} since last poll. "
+            f"{counts['ERROR']} ERROR/CRITICAL-level events in {log_path.name} since last poll. "
             f"Investigate `/diagnose` or tail the log.",
             state, kind=f"errors:{name}", cooldown_min=cooldown,
         )

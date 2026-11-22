@@ -1,0 +1,198 @@
+"""A single "flat" position read must not strip a live position's stop.
+
+Regression for the 2026-11 review finding N1 (A-blind Pass 2 item A,
+B-informed N1): `_detect_bracket_exit` acted on ONE flat read — it swept the
+leg's SL and TP, advanced the snapshot, and (elsewhere) `_maybe_reprotect`
+erased `active_bracket` and `_maybe_finish_no_stop_close` cleared the pending
+close with a false "now flat" mail. fetch_position folds empty / malformed
+payloads into flat, and donchian / SOL have no reprotect, so nothing put the
+stop back.
+
+These tests script every read explicitly (they do NOT use agree_on_flat).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from exchange import state
+from exchange.binance_client import BinanceClient, PositionUnknown
+from tests.test_orphan_bracket_cleanup import _flat, _make_bot, _open
+
+ENTRY, QTY, EXIT_PX, ROOT = 65_000.0, 0.01, 64_000.0, "1787375710921"
+SL = {"algoId": "1", "clientAlgoId": f"snap-v1-{ROOT}-s", "side": "SELL",
+      "reduceOnly": True, "algoStatus": "NEW"}
+TP = {"algoId": "2", "clientAlgoId": f"snap-v1-{ROOT}-t", "side": "SELL",
+      "reduceOnly": True, "algoStatus": "NEW"}
+
+
+def _bot():
+    b, mc = _make_bot()
+    state.record_fill(side="long", qty=QTY, price=ENTRY, reason="entry",
+                      client_order_id_root=ROOT)
+    b._last_position_side = "long"
+    b._last_position_entry = ENTRY
+    b._last_position_qty = QTY
+    b._last_entry_root = ROOT
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None   # scripted per test below
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": EXIT_PX}]
+    return b, mc
+
+
+def _tick(b):
+    with patch("bot.send_alert") as alert:
+        b._detect_bracket_exit(equity=1000.0)
+    return alert
+
+
+def _fills():
+    import sqlite3
+    with sqlite3.connect(state.DB_PATH) as c:
+        return [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+
+
+def _assert_untouched(b, mc):
+    mc.cancel_open_orders.assert_not_called()
+    assert _fills() == ["entry"]
+    assert b._last_position_side == "long"
+    assert b._last_position_entry == ENTRY
+    assert b._last_position_qty == QTY
+    assert b._last_entry_root == ROOT
+    assert b._exit_retry_n == 0
+
+
+# --- bracket-exit site --------------------------------------------------------
+
+def test_flat_read_contradicted_by_reread_cancels_nothing():
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _open("long", ENTRY, QTY)
+    b._ext_pending = 0.005  # a size-change debounce in flight must survive
+    _tick(b)
+    _assert_untouched(b, mc)
+    assert b._ext_pending == 0.005
+    # and the next (healthy) tick is an ordinary open tick, not a "first look"
+    mc.fetch_position.return_value = _open("long", ENTRY, QTY)
+    _tick(b)
+    mc.cancel_open_orders.assert_not_called()
+    assert not b._flat_pending(b.BRACKET_SITE)
+
+
+def test_reread_error_is_unknown_not_flat():
+    b, mc = _bot()
+    mc.fetch_position_checked.side_effect = PositionUnknown("no contracts field")
+    _tick(b)
+    _assert_untouched(b, mc)
+    assert b._entry_blocked()  # no entry while the flat is unconfirmed
+
+
+def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
+    """TP filled: the TP is gone from the algo book, the SL sibling rests.
+    That IS the fill evidence — sweep and record on this tick (no latency)."""
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL], True)
+    _tick(b)
+    mc.cancel_open_orders.assert_called_once_with("BTC/USDT:USDT", coid_prefix="snap-v1-")
+    assert _fills() == ["entry", "bracket_exit"]
+    assert b._last_position_side == "flat"
+    assert not b._flat_pending(b.BRACKET_SITE)
+
+
+@pytest.mark.parametrize("book", [([SL, TP], True), ([], False)],
+                         ids=["bracket-intact", "algo-book-unreadable"])
+def test_no_fill_evidence_defers_then_accepts_with_an_alert(book):
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = book
+    alert = _tick(b)
+    _assert_untouched(b, mc)
+    alert.assert_not_called()
+    assert b._entry_blocked()
+    # flat again next tick → accepted (manual close / liquidation), mailed once
+    alert = _tick(b)
+    mc.cancel_open_orders.assert_called_once()
+    assert _fills() == ["entry", "bracket_exit"]
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert any("position flat" in s for s in subjects), subjects
+    assert not b._flat_pending(b.BRACKET_SITE)
+
+
+def test_flat_then_open_resets_the_debounce():
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    _tick(b)                                         # 1/2
+    mc.fetch_position.return_value = _open("long", ENTRY, QTY)
+    _tick(b)                                         # open again → reset
+    mc.fetch_position.return_value = _flat()
+    _tick(b)                                         # 1/2 again, not 2/2
+    _assert_untouched(b, mc)
+
+
+def test_retry_of_an_already_confirmed_exit_skips_confirmation():
+    b, mc = _bot()
+    b._exit_retry_n = 1  # the edge was confirmed and swept on an earlier tick
+    mc.fetch_position_checked.side_effect = AssertionError("must not re-confirm")
+    _tick(b)
+    assert _fills() == ["entry", "bracket_exit"]
+
+
+# --- no-stop retry site -------------------------------------------------------
+
+def test_no_stop_retry_flat_contradicted_keeps_pending():
+    from tests.test_no_stop_fixpass import _pending_after_failed_close
+    b, _ex = _pending_after_failed_close()
+    pending = b._pending_record()
+    b.client.fetch_position = MagicMock(return_value=_flat())
+    b.client.fetch_position_checked = MagicMock(
+        return_value=_open(pending["side"], 65_000.0, float(pending["qty"])))
+    with patch("bot.send_alert") as alert:
+        b._maybe_finish_no_stop_close(150.0)
+    assert b._pending_record() is not None
+    assert not any("flat" in c.args[0].lower() for c in alert.call_args_list)
+
+
+# --- reprotect site -----------------------------------------------------------
+
+def test_reprotect_single_flat_keeps_active_bracket():
+    b, mc = _bot()
+    b.params = {**b.params, "reprotect": {"enabled": True}}
+    state.set_meta("active_bracket", '{"side": "long"}')
+    mc.fetch_position_checked.return_value = _open("long", ENTRY, QTY)
+    b._maybe_reprotect(equity=1000.0)
+    assert state.get_meta("active_bracket") == '{"side": "long"}'
+
+
+# --- the strict read itself -------------------------------------------------
+
+def _client(payload):
+    ex = MagicMock()
+    ex.fetch_positions.return_value = payload
+    return BinanceClient(ex=ex, env="testnet", coid_prefix="snap-v1-")
+
+
+def test_checked_read_flat_on_empty_list():
+    # V3 positionRisk omits flat symbols: empty IS the normal flat answer
+    assert _client([]).fetch_position_checked("BTC/USDT:USDT").side == "flat"
+
+
+@pytest.mark.parametrize("payload", [
+    None,
+    [{"symbol": "BTC/USDT:USDT", "contracts": None, "side": "long"}],
+    [{"symbol": "BTC/USDT:USDT", "side": "long"}],
+    [{"symbol": "BTC/USDT:USDT", "contracts": "abc", "side": "long"}],
+], ids=["not-a-list", "contracts-None", "contracts-missing", "contracts-garbage"])
+def test_checked_read_unknown_on_malformed(payload):
+    with pytest.raises(PositionUnknown):
+        _client(payload).fetch_position_checked("BTC/USDT:USDT")
+
+
+def test_checked_read_open():
+    p = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "long",
+                  "entryPrice": 65000.0}]).fetch_position_checked("BTC/USDT:USDT")
+    assert (p.side, p.qty) == ("long", 0.01)

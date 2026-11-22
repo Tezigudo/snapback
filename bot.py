@@ -61,6 +61,7 @@ from bot_internals import (
     adopt_loop_guard,
     adopt_precheck,
     breakeven_due,
+    algo_bracket_leg,
     breakeven_stop_price,
     can_adopt,
     channel_exit_signal,  # noqa: F401  (re-exported; tools import it from here)
@@ -441,6 +442,10 @@ class Bot:
         # Consecutive ticks a detected exit has failed to be RECORDED (see
         # _hold_unrecorded_exit). Reset on success and on giving up.
         self._exit_retry_n: int = 0
+        # Consecutive ticks each call site has seen an UNCONFIRMED flat read
+        # for a position it believed open (see _confirm_flat). One counter per
+        # site, so three reads in one tick can never "confirm" each other.
+        self._flat_seen: dict[str, int] = {}
         # Throttle bracket re-placement (see _maybe_reprotect) so a persistent
         # placement failure can't spam orders/alerts every poll.
         self._last_reprotect_ts: float = 0.0
@@ -1715,6 +1720,12 @@ class Bot:
 
     def _entry_blocked(self) -> bool:
         """Fails CLOSED: an unreadable record blocks entries (the safe side)."""
+        # A flat edge awaiting confirmation: the old position's stop / TP may
+        # still rest, and a new entry now would be treated as a REPLACEMENT
+        # next tick — a path that deliberately never sweeps — leaving the old
+        # reduce-only legs live against the new position.
+        if self._flat_pending(self.BRACKET_SITE):
+            return True
         if self._pending_record() is not None:
             return True
         if not self._pending_meta_stale and \
@@ -2025,6 +2036,11 @@ class Bot:
             self._no_stop_next_try = now + self._no_stop_backoff_s
             return
         if pos.side == "flat" or not pos.qty:
+            # Confirm before clearing: a false flat here clears the ONLY thing
+            # still trying to close a naked position, and mails "now flat".
+            if not self._confirm_flat("no_stop_retry", stop_evidence=False):
+                self._no_stop_next_try = now  # re-check next tick, no backoff
+                return
             self._clear_pending()
             if self._newest_fill_is_entry_of(root):
                 try:
@@ -2040,6 +2056,7 @@ class Bot:
                        f"was trying to close is flat. Pending close cleared; entries "
                        f"resume.\nsignal_id: {root or '(untagged)'}")
             return
+        self._flat_clear("no_stop_retry")
         tol = max(float(self.constraints.qty_step or 0.0) / 2, 1e-12)
         # Abandon only on PROOF it is not ours: other side/size, or a NEWER
         # entry row exists. A missing/unreadable entry row for `root` proves
@@ -2783,9 +2800,14 @@ class Bot:
         if pos.side == "flat" or pos.qty == 0:
             # No position → drop any stale bracket record so it can never be
             # applied to a later, unrelated position (the side + entry-price
-            # guards below are the second line of defence).
-            state.set_meta("active_bracket", "")
+            # guards below are the second line of defence). Only once the flat
+            # is CONFIRMED and only if there is a record to drop: erasing it on
+            # a false flat turns reprotect off for a position that is open.
+            if state.get_meta("active_bracket") and self._confirm_flat(
+                    "reprotect", stop_evidence=False):
+                state.set_meta("active_bracket", "")
             return
+        self._flat_clear("reprotect")
         raw = state.get_meta("active_bracket")
         if not raw:
             return
@@ -3020,6 +3042,94 @@ class Bot:
     # against a window that no longer contains the close at all.
     EXIT_RETRY_LIMIT = 60
 
+    # --- flat confirmation (2026-11 review, N1) ------------------------------
+    # One "flat" position read used to be enough to cancel the leg's stop and
+    # TP, erase `active_bracket` and clear a pending no-stop close with a
+    # "now flat" mail. fetch_position cannot say "unknown" — an empty, stale or
+    # malformed payload reads as flat — and donchian / SOL have no reprotect,
+    # so nothing would put the stop back. A flat that the bot is about to ACT
+    # on must now be confirmed.
+    FLAT_ACCEPT_TICKS = 2      # consecutive flat ticks that accept a flat with no fill evidence
+    BRACKET_SITE = "bracket_exit"
+
+    def _flat_pending(self, site: str) -> bool:
+        return self._flat_seen.get(site, 0) > 0
+
+    def _flat_clear(self, site: str) -> None:
+        self._flat_seen.pop(site, None)
+
+    def _confirm_flat(self, site: str, *, stop_evidence: bool) -> bool:
+        """A read just said FLAT where `site` believed a position open. True
+        only when that flat is CONFIRMED; False means "unknown — act on
+        nothing this tick" (the caller keeps all its state and retries).
+
+        Confirmation, cheapest first:
+          1. A second, independent, strictly-parsed read
+             (`fetch_position_checked`). Open → the first read was false; a
+             malformed payload or an error → unknown.
+          2. `stop_evidence` (bracket-exit site): the leg's own bracket is no
+             longer INTACT in the algo book — the stop (`-s` / `-sb`) is gone, or
+             the TP (`-t`) is gone on a leg that places one. A bracket leg
+             vanishing is what an SL or TP fill looks like: confirmed at once,
+             same tick, no added latency. An intact bracket (every leg the
+             position had is still resting) or an unreadable algo book is NOT
+             evidence of a fill: defer.
+          3. Otherwise the flat must persist for FLAT_ACCEPT_TICKS consecutive
+             ticks (a manual close or liquidation leaves our stop resting; we
+             must not wait for ever). Accepting that way mails once.
+
+        API weight: one positionRisk read (+ one openAlgoOrders read on the
+        bracket site) per flat-edge tick only — never on a healthy open or a
+        healthy flat tick.
+        """
+        n = self._flat_seen.get(site, 0) + 1
+        self._flat_seen[site] = n
+        try:
+            second = self.client.fetch_position_checked(self.symbol)
+        except Exception as e:
+            self.log.warning("%s: flat read NOT confirmed — re-read failed (%s); "
+                             "treating the position as UNKNOWN, nothing changed "
+                             "(%d/%d)", site, e, n, self.FLAT_ACCEPT_TICKS)
+            return False
+        if second.side != "flat" and second.qty > 0:
+            self._flat_clear(site)
+            self.log.warning("%s: single FLAT read contradicted by a re-read "
+                             "(%s %.6f) — treated as open, nothing cancelled",
+                             site, second.side, second.qty)
+            return False
+        intact: bool | None = None
+        if stop_evidence:
+            rows, ok = self.client.fetch_algo_orders(self.symbol)
+            if ok:
+                legs = {algo_bracket_leg(r, self.coid_prefix) for r in rows}
+                intact = "sl" in legs and (
+                    "tp" in legs
+                    or strategy_uses_channel_exit(self.strategy_name))  # no TP placed
+            if intact is False:
+                self._flat_clear(site)
+                return True
+        if n >= self.FLAT_ACCEPT_TICKS:
+            self._flat_clear(site)
+            if stop_evidence:
+                msg = ("bracket still intact" if intact
+                       else "algo book unreadable")
+                self.log.warning("%s: flat accepted after %d consecutive flat "
+                                 "ticks with no fill evidence (%s) — closed "
+                                 "outside the bot?", site, n, msg)
+                send_alert(f"{self.instance}: position flat, {msg}",
+                           f"{site}: {n} consecutive flat position reads, but "
+                           f"no evidence the SL or TP filled ({msg}). Treating the "
+                           f"position as closed (manual close or liquidation?) "
+                           f"and sweeping the leg's orders. Check Binance.")
+            return True
+        self.log.warning("%s: flat read awaiting confirmation (%d/%d)%s — "
+                         "nothing cancelled or cleared this tick", site, n,
+                         self.FLAT_ACCEPT_TICKS,
+                         "" if not stop_evidence else
+                         (" — bracket still intact" if intact
+                          else " — algo book unreadable"))
+        return False
+
     def _hold_unrecorded_exit(self, side: str, entry: float | None,
                               qty: float | None, root: str | None) -> None:
         """Keep a DETECTED but UNRECORDED exit alive for a retry — either path.
@@ -3117,6 +3227,21 @@ class Bot:
             prev_qty = self._last_position_qty
             prev_root = self._last_entry_root
             had_open = prev_side not in ("flat", "unknown")
+
+            # ⚠️ CONFIRM A FLAT EDGE BEFORE ANYTHING BELOW TOUCHES STATE. An
+            # unconfirmed flat must return HERE, ahead of the snapshot refresh:
+            # advancing to "flat" would sweep a live stop, and advancing to
+            # "unknown" would make the next tick a silent "first observation"
+            # and drop a real exit (the 2026-09-04 failure). It also must not
+            # reset the _ext_pending debounce below. Not a retry either: it
+            # never touches _exit_retry_n. A retry of an exit that was already
+            # confirmed (_exit_retry_n > 0) has swept already and skips this.
+            if current == "flat" and had_open:
+                if self._exit_retry_n == 0 and not self._confirm_flat(
+                        self.BRACKET_SITE, stop_evidence=True):
+                    return
+            else:
+                self._flat_clear(self.BRACKET_SITE)
 
             # A position we were tracking can disappear two ways:
             #   flat      — the classic open→flat edge.
