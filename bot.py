@@ -4267,7 +4267,20 @@ class Bot:
                         (int(now) // self.bar_seconds) * self.bar_seconds - 1)
                 else:
                     self._note_held(now)
-                order, _flat = self._close_then_sweep(root, "x", "time-stop")
+                order, flat = self._close_then_sweep(root, "x", "time-stop")
+                if order is None or not flat:
+                    # F2: book NOTHING. None = nothing was sent (already flat:
+                    # an SL/TP got there first); not flat = close-failed alert
+                    # already sent, the position may still be open. Either way
+                    # the fills row is still `entry`, so the next tick's flat
+                    # edge records the REAL exit from the exchange's trades
+                    # (with its true price/PnL); an open position re-fires the
+                    # time stop next tick.
+                    self.log.warning("time-stop: close %s — nothing recorded; "
+                                     "the flat edge records the real exit",
+                                     "found the position already flat" if order is None
+                                     else "NOT confirmed flat")
+                    return
                 exit_price = self._resolve_fill_price(order)
                 _entry = self._open_entry_fill()
                 state.record_fill(side="close", qty=pos.qty,
@@ -4348,7 +4361,14 @@ class Bot:
             # A bot close on this tick consumes the bar it was decided on, so
             # _maybe_enter can't re-enter on that same bar later in the tick.
             self._note_held(time.time())
-            order, _flat = self._close_then_sweep(root, "ce", "trend-exit")
+            order, flat = self._close_then_sweep(root, "ce", "trend-exit")
+            if order is None or not flat:
+                # F2: book nothing — see _maybe_time_stop.
+                self.log.warning("trend-exit: close %s — nothing recorded; "
+                                 "the flat edge records the real exit",
+                                 "found the position already flat" if order is None
+                                 else "NOT confirmed flat")
+                return
             exit_price = self._resolve_fill_price(order)
             _entry = self._open_entry_fill()
             state.record_fill(side="close", qty=pos.qty,
