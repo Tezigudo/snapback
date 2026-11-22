@@ -328,3 +328,32 @@ def test_trend_exit_books_nothing_when_unconfirmed():
         b._maybe_channel_exit(equity=1000.0)
     mc.close_position.assert_called_once()
     assert _reasons() == ["entry"]
+
+
+# --- G2 (round 3): breakeven close books nothing unless flat is confirmed -----
+
+def test_breakeven_close_unconfirmed_books_nothing_and_keeps_be_moved_false():
+    import sqlite3
+
+    from exchange.binance_client import Position
+    from tests.test_sol_breakeven import ENTRY, QTY, _ab, _ohlcv, _seed
+    from tests.test_sol_breakeven import _bot as _sol_bot
+    bot, mc = _sol_bot()
+    _seed()
+    _ohlcv(mc, [104, 120, 106])
+    mc.fetch_mark_price.return_value = 100.1            # already through breakeven
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"average": 0.0}   # price unknown too
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = Position("SOL/USDT:USDT", "long", QTY,
+                                                      ENTRY, 0.0, 0.0)
+    with patch("bot.send_alert") as alert:
+        bot._maybe_breakeven(100.0)
+    with sqlite3.connect(state.DB_PATH) as c:
+        reasons = [r[0] for r in c.execute("SELECT reason FROM fills ORDER BY id")]
+    assert "breakeven_exit" not in reasons
+    assert not _ab().get("be_moved")
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert "Bot breakeven close" not in subjects
+    assert any("breakeven close FAILED" in s for s in subjects)
+    mc.cancel_open_orders.assert_not_called()
