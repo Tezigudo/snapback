@@ -2505,13 +2505,20 @@ class Bot:
                 self.log.critical("NO STOP on a partly-attributable %s %.4f (root=%s): "
                                   "%s — NOT closed (not wholly ours)",
                                   pos.side, pos.qty, root, e.sl_error)
+                # sourcery 4657588366: return False so the caller KEEPS its
+                # unverified record and the guard retries the stop every poll;
+                # one alert per root
+                _seen = self.__dict__.setdefault("_mixed_nostop_alerted", set())
+                if root in _seen:
+                    return False
+                _seen.add(root)
                 send_alert("NO STOP — position NOT closed (not wholly the bot's)",
                            f"{pos.side.upper()} {pos.qty:.4f} {self.base_asset} is open, "
                            f"only {float(entry_qty or 0):.4f} of it is attributable to "
                            f"entry {root}, and no stop could be placed: {e.sl_error}.\n"
                            f"Intended stop: {sl_price:,.4f}. The bot does NOT close a "
                            f"position that is not wholly its own. CHECK BINANCE NOW.")
-                return True
+                return False
             self._note_no_stop_entry(e.sl_error)
             self._finish_no_stop(pos.side, pos.qty, pos.entry_price, root, equity,
                                  closed=e.closed, order=e.close_order,
@@ -2636,36 +2643,52 @@ class Bot:
                 self.log.warning("unverified entry %s: flat confirmed but the order's "
                                  "filled qty is unreadable — record kept", root)
                 return
+            # H1 (round 4) + sourcery 4657588376: the GTC limit can fill BETWEEN
+            # the strict read above and the cancel, and the order-status read can
+            # lag it. So after EVERY successful cancel re-confirm the position
+            # strictly, whatever `filled` says: open -> protect it now (never clear
+            # and walk away from a naked fill); unknown -> keep the record, retry.
+            try:
+                now_pos = self.client.fetch_position_checked(self.symbol)
+            except Exception as e:
+                self.log.warning("unverified entry %s: filled=%.6f; position "
+                                 "re-read not confirmed (%s) — record kept",
+                                 root, filled, e)
+                return
+            if now_pos.side != "flat" and now_pos.qty:
+                if now_pos.side != u.get("side"):
+                    # sourcery 4657588360: never put this entry's bracket on a
+                    # foreign (opposite-side) position
+                    self._clear_unverified()
+                    send_alert("Entry error — open position is not ours, untouched",
+                               f"Watching entry {root} ({u.get('side')}) but a "
+                               f"{now_pos.side} {now_pos.qty:.4f} position is open "
+                               f"after the cancel. NOT touched. Check Binance.")
+                    return
+                self.log.error("unverified entry %s: FILLED %.6f at the cancel — "
+                               "%s %.6f is OPEN; protecting it", root, filled,
+                               now_pos.side, now_pos.qty)
+                send_alert("Entry error — entry FILLED at cancel, position OPEN",
+                           f"Entry {root} filled {filled:.6f} {self.base_asset} while "
+                           f"the bot was cancelling it; a {now_pos.side} "
+                           f"{now_pos.qty:.6f} position is open. The no-stop rule "
+                           f"now protects it (stop, else close).")
+                ours = now_pos.side == u.get("side") and now_pos.qty <= filled + tol
+                if self._protect_or_close_open(
+                        now_pos, root, float(u["sl_distance"]),
+                        float(u["tp_distance"]), bool(u.get("place_tp", True)),
+                        equity, why="entry order filled at the cancel",
+                        record_if_flat=False, may_close=ours, entry_qty=filled):
+                    self._clear_unverified()
+                return
             if filled > tol:
-                # H1 (round 4): the GTC limit can fill BETWEEN the strict read
-                # above and the cancel. Re-confirm the position before calling
-                # it "flat": open -> protect it now (never clear and walk away
-                # from a naked fill); unknown -> keep the record, retry.
-                try:
-                    now_pos = self.client.fetch_position_checked(self.symbol)
-                except Exception as e:
-                    self.log.warning("unverified entry %s: it FILLED %.6f; position "
-                                     "re-read not confirmed (%s) — record kept",
-                                     root, filled, e)
-                    return
-                if now_pos.side != "flat" and now_pos.qty:
-                    self.log.error("unverified entry %s: FILLED %.6f at the cancel — "
-                                   "%s %.6f is OPEN; protecting it", root, filled,
-                                   now_pos.side, now_pos.qty)
-                    send_alert("Entry error — entry FILLED at cancel, position OPEN",
-                               f"Entry {root} filled {filled:.6f} {self.base_asset} while "
-                               f"the bot was cancelling it; a {now_pos.side} "
-                               f"{now_pos.qty:.6f} position is open. The no-stop rule "
-                               f"now protects it (stop, else close).")
-                    ours = now_pos.side == u.get("side") and now_pos.qty <= filled + tol
-                    if self._protect_or_close_open(
-                            now_pos, root, float(u["sl_distance"]),
-                            float(u["tp_distance"]), bool(u.get("place_tp", True)),
-                            equity, why="entry order filled at the cancel",
-                            record_if_flat=False, may_close=ours, entry_qty=filled):
-                        self._clear_unverified()
-                    return
                 self._clear_unverified()
+                if u.get("after_emergency_close"):
+                    # the bot's own emergency close flattened this fill
+                    self.log.warning("unverified entry %s: filled %.6f, closed by "
+                                     "the bot's emergency close — entry order now "
+                                     "proven gone", root, filled)
+                    return
                 self.log.error("unverified entry %s: it FILLED %.6f but the position "
                                "is now confirmed flat — closed outside the ledger",
                                root, filled)
