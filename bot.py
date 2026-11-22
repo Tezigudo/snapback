@@ -511,6 +511,7 @@ class Bot:
     def boot(self) -> None:
         check_symbol(self.symbol)
         check_leverage(self.leverage)
+        self._check_time_stop_parity()
 
         # Load live exchange constraints (min qty, min notional). Tighter
         # of hard-coded fallbacks vs live values wins.
@@ -821,6 +822,28 @@ class Bot:
                        f"{self.instance} leg: {msg}")
         except Exception:
             self.log.exception("boot: already-flat alert failed")
+
+    def _check_time_stop_parity(self) -> bool:
+        """Live time-stops on `strategy.max_hold_bars` (_maybe_time_stop); the
+        backtest on `strategy.time_stop_bars`. If both are set and differ, the
+        backtest is not modelling the live exit (2026-11 review: the donchian
+        harness ignored the live 48-bar time stop once). ERROR-level so the
+        monitor's ERROR alert mails it; does NOT refuse boot — this is a
+        research-parity defect, not a live-money hazard. Returns True on parity.
+        """
+        s = (getattr(self, "params", None) or {}).get("strategy") or {}
+        ts, mh = s.get("time_stop_bars"), s.get("max_hold_bars")
+        if ts is None or mh is None:
+            return True
+        try:
+            if int(ts) == int(mh):
+                return True
+        except (TypeError, ValueError):
+            pass
+        self.log.error("PARAMS PARITY: strategy.time_stop_bars=%r (backtest) != "
+                       "strategy.max_hold_bars=%r (live time stop) — the backtest "
+                       "does not model this leg's live exit", ts, mh)
+        return False
 
     def stop(self, *_args) -> None:
         self._stopped = True
