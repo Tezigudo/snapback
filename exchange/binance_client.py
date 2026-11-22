@@ -881,8 +881,10 @@ class BinanceClient:
         pass a fresh one so a reused id cannot hit the duplicate path); sweeps
         still use `root`.
 
-        Only this root's own orders are swept (before AND after the close — a
-        timed-out stop can land late), never the whole prefix.
+        Only this root's own orders are swept, never the whole prefix: its
+        resting entry order before the close, all its legs AFTER a confirmed
+        flat (a timed-out stop can land late). G9: stops are never swept before
+        the close, and not after an unconfirmed one.
         """
         last: BaseException | None = None
         blind = side in ("long", "short") and float(qty or 0) > 0
@@ -906,7 +908,15 @@ class BinanceClient:
                         return True, None, None
                     c_side, c_qty = p.side, p.qty
                 order = self._reduce_only_close(symbol, c_side, c_qty, root, coid_root)
-                self._sweep_root_quietly(symbol, root)
+                # G9: sweep the root's legs only once flat is CONFIRMED; an
+                # unconfirmed close keeps the stops (if any) resting.
+                try:
+                    flat = self.fetch_position_checked(symbol).side == "flat"
+                except Exception as e:
+                    log.warning("post-close flat check failed — root legs kept: %s", e)
+                    flat = False
+                if flat:
+                    self._sweep_root_quietly(symbol, root)
                 return True, order, None
             except Exception as e:
                 last = e
@@ -924,9 +934,21 @@ class BinanceClient:
 
     def _reduce_only_close(self, symbol: str, side: str, qty: float,
                            root: str | None, coid_root: str | None = None) -> dict[str, Any]:
-        """Sweep THIS root's legs, then a reduce-only market close of a KNOWN
-        position."""
-        self._sweep_root_quietly(symbol, root)
+        """Reduce-only market close of a KNOWN position.
+
+        G9 (2026-11 round 3): this used to sweep ALL of the root's legs first.
+        The no-stop paths are "no VERIFIED stop", not "no stop": the
+        books-unreadable close (bot._protect_or_close_open) cannot see whether
+        a stop rests, so a pre-close sweep could remove the one protection the
+        position has and then fail to close. Only the root's resting ENTRY
+        order (-e) is cancelled first, so a late entry fill cannot add to the
+        position being closed; stops stay until emergency_close confirms flat.
+        A reduce-only close coexists with resting reduce-only brackets (the
+        live close-first path, _close_then_sweep / breakeven, relies on it)."""
+        try:
+            self.cancel_entry_order(symbol, root)
+        except Exception as e:
+            log.warning("pre-close entry-order cancel failed (closing anyway): %s", e)
         params: dict[str, Any] = {"reduceOnly": True}
         if (coid := _coid(coid_root or root, "ns", self.coid_prefix)):
             params["newClientOrderId"] = coid
