@@ -513,9 +513,12 @@ class TestBootOrphanSweep:
              patch("bot.principal.get_principal", MagicMock(return_value=None)):
             bot.boot()
 
-        # The new flat-path else-branch must not run when a position is open.
-        # (mc.close_position is a mock stub, so it doesn't cancel through here.)
-        mc.cancel_open_orders.assert_not_called()
+        # The flat-path else-branch must not run when a position is open. The
+        # ONE sweep is the post-close sweep (2026-11: close first, confirm
+        # flat, then sweep), and it comes AFTER close_position.
+        mc.cancel_open_orders.assert_called_once_with("BTC/USDT:USDT", coid_prefix="snap-v1-")
+        order = [c[0] for c in mc.mock_calls if c[0] in ("close_position", "cancel_open_orders")]
+        assert order == ["close_position", "cancel_open_orders"]
 
 
 # ---------------------------------------------------------------------------

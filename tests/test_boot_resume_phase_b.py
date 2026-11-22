@@ -360,7 +360,7 @@ class TestD5AdoptLoopGuard:
 
         _bot, mc, alert = _boot_once()
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
         assert len(_guard_alerts(alert)) == 1
         assert _adopt_log()["count"] == 3        # refusal does not bump it
         assert _outbox_kinds().count("boot_adopt") == 3

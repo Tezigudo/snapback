@@ -276,7 +276,7 @@ class TestCanAdopt:
         with _boot_patches(), _state_patches(bracket=legacy), _principal_patches():
             bot.boot()
         mc.close_position.assert_called_once_with(
-            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf")
+            "BTC/USDT:USDT", client_order_id_root="sig-1", close_leg="bf", sweep_first=False)
 
     def test_refuses_an_sl_only_bracket(self):
         """donchian-v3 places no TP leg. bracket_state would be asked about a
