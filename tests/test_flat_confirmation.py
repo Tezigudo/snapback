@@ -283,3 +283,29 @@ def test_checked_read_open():
     p = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "long",
                   "entryPrice": 65000.0}]).fetch_position_checked("BTC/USDT:USDT")
     assert (p.side, p.qty) == ("long", 0.01)
+
+
+# --- F9: the debounce counts STRICTLY consecutive loop ticks ------------------
+
+def test_debounce_resets_across_a_skipped_tick():
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    b._tick_seq = 10
+    _tick(b)                                  # 1/2 at tick 10
+    b._tick_seq = 12                          # tick 11: detector skipped (equity None)
+    _tick(b)                                  # streak broken: 1/2 again, NOT accepted
+    _assert_untouched(b, mc)
+    b._tick_seq = 13
+    _tick(b)                                  # 2/2 on consecutive ticks: accepted
+    mc.cancel_open_orders.assert_called_once()
+
+
+def test_two_calls_in_one_tick_do_not_confirm():
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    b._tick_seq = 5
+    _tick(b)
+    _tick(b)                                  # same tick: still 1/2
+    _assert_untouched(b, mc)

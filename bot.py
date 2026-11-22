@@ -446,7 +446,8 @@ class Bot:
         # Consecutive ticks each call site has seen an UNCONFIRMED flat read
         # for a position it believed open (see _confirm_flat). One counter per
         # site, so three reads in one tick can never "confirm" each other.
-        self._flat_seen: dict[str, int] = {}
+        self._flat_seen: dict[str, tuple[int, int | None]] = {}   # site -> (n, tick)
+        self._tick_seq: int | None = None   # loop() tick index (F9)
         # Throttle bracket re-placement (see _maybe_reprotect) so a persistent
         # placement failure can't spam orders/alerts every poll.
         self._last_reprotect_ts: float = 0.0
@@ -3325,7 +3326,7 @@ class Bot:
             self.log.exception("tp-placed bookkeeping failed")
 
     def _flat_pending(self, site: str) -> bool:
-        return self._flat_seen.get(site, 0) > 0
+        return site in self._flat_seen
 
     def _flat_clear(self, site: str) -> None:
         self._flat_seen.pop(site, None)
@@ -3354,8 +3355,21 @@ class Bot:
         bracket site) per flat-edge tick only — never on a healthy open or a
         healthy flat tick.
         """
-        n = self._flat_seen.get(site, 0) + 1
-        self._flat_seen[site] = n
+        # F9: STRICTLY consecutive loop ticks. A tick on which this site did
+        # not run (equity unknown → the detector is skipped) breaks the
+        # streak; a second call within the same tick does not extend it.
+        # Outside loop() (no tick index) every call counts as a new tick.
+        seq = getattr(self, "_tick_seq", None)
+        prev_n, prev_seq = self._flat_seen.get(site, (0, None))
+        if seq is None or prev_seq is None:
+            n = prev_n + 1
+        elif prev_seq == seq:
+            n = prev_n
+        elif prev_seq == seq - 1:
+            n = prev_n + 1
+        else:
+            n = 1
+        self._flat_seen[site] = (n, seq)
         try:
             second = self.client.fetch_position_checked(self.symbol)
         except Exception as e:
@@ -4799,6 +4813,7 @@ class Bot:
         backoff_s = self.poll_s
         transient_backoff_s = self.poll_s
         while not self._stopped:
+            self._tick_seq = (getattr(self, "_tick_seq", None) or 0) + 1
             try:
                 self._heartbeat()
                 halt_by = halt_source(self.instance)
