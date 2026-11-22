@@ -4395,6 +4395,7 @@ class Bot:
                 self.log.info("Time-stop firing after %.1f hours (root=%s)",
                               age_s / 3600, root or "—")
                 now = time.time()
+                held_before = self._position_held_at   # G11: for a rollback
                 if time_stop_reenters_same_bar(self.strategy_name):
                     # Its backtest closes on this bar's close and may enter on
                     # the SAME bar: count the position as gone just before that
@@ -4405,6 +4406,13 @@ class Bot:
                     self._note_held(now)
                 order, flat = self._close_then_sweep(root, "x", "time-stop")
                 if order is None or not flat:
+                    # G11: the same-bar stamp above is only valid for a time
+                    # stop that actually closed the position. Unconfirmed (it
+                    # may still be open) or not ours (an SL/TP got there
+                    # first): restore the previous stamp and mark the position
+                    # held NOW, so no entry can treat this bar as freed.
+                    self._position_held_at = held_before
+                    self._note_held(now)
                     # F2: book NOTHING. None = nothing was sent (already flat:
                     # an SL/TP got there first); not flat = close-failed alert
                     # already sent, the position may still be open. Either way
