@@ -435,6 +435,30 @@ class TestRedTeam2:
         assert not any("nothing filled" in s for s in subjects)
         assert any("FILLED" in s for s in subjects)
 
+    def test_H1_fill_landing_at_the_cancel_is_protected_not_called_flat(self) -> None:
+        """Round 4: the GTC limit fills between the strict flat read and the
+        cancel. The bot must not clear the record and mail "position now flat"
+        while a naked position is open: re-read, then protect it."""
+        import time as _t
+        bot, ex = self._donch_limit()
+        with patch("bot.send_alert"):
+            _enter(bot)
+        ex.pos = None
+        ex.entry_filled = 0.005
+        real_cancel = bot.client.cancel_entry_order
+
+        def _cancel_lands_fill(symbol, root):
+            ex.pos = ("long", 0.005, 65000.0)        # the fill lands at the cancel
+            return real_cancel(symbol, root) or True
+        bot.client.cancel_entry_order = _cancel_lands_fill
+        with patch("bot.send_alert") as alert:
+            self._tick(bot, _t.time() + 120)
+        subjects = _subjects(alert)
+        assert not any("position now flat" in s for s in subjects), subjects
+        assert any("FILLED at cancel" in s for s in subjects)
+        assert ex.pos is None or any(str(r.get("clientAlgoId", "")).endswith("-s")
+                                     for r in ex.algo)   # protected or closed
+
     def test_G1_unreadable_filled_qty_keeps_the_record(self) -> None:
         _b, _ex, subjects = self._settled(filled=None)
         assert state.get_meta("entry_unverified")

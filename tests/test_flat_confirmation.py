@@ -335,3 +335,32 @@ def test_without_a_bot_close_it_still_asks_manual_close():
     alert = _tick(b)
     body = " ".join(c.args[1] for c in alert.call_args_list)
     assert "manual close or liquidation?" in body
+
+
+# --- G10 (round 3): account-endpoint fallback V2 -> V3 -----------------------
+
+def test_v2_failing_falls_back_to_v3_present_zero_row():
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    c.ex.fapiPrivateV2GetAccount.side_effect = RuntimeError("410 gone")
+    c.ex.fapiPrivateV3GetAccount.return_value = {
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "0"}]}
+    assert c.fetch_position_checked("BTC/USDT:USDT").side == "flat"
+
+
+def test_v3_absent_row_is_not_flat():
+    # V3 omits flat symbols with no orders: absence there cannot confirm flat
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    del c.ex.fapiPrivateV2GetAccount
+    c.ex.fapiPrivateV3GetAccount.return_value = {"positions": []}
+    with pytest.raises(PositionUnknown):
+        c.fetch_position_checked("BTC/USDT:USDT")
+
+
+def test_v2_used_first_when_it_answers():
+    c = _client([])
+    c.ex.market.return_value = {"id": "BTCUSDT"}
+    _acct(c.ex, [{"symbol": "BTCUSDT", "positionAmt": "0"}])
+    c.fetch_position_checked("BTC/USDT:USDT")
+    c.ex.fapiPrivateV3GetAccount.assert_not_called()

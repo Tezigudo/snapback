@@ -101,6 +101,7 @@ class TestEntryCalls:
         assert ex.calls == [self.LIMIT, self.POLL, self.POLL,
                             ("cancel_order", "lim-1", SYMBOL),
                             self.POLL, self.POS,
+                            ("account", None),   # G8: strict flat before the fallback
                             ("create_order", SYMBOL, "market", "buy", 0.005, None,
                              {"reduceOnly": False, "newClientOrderId": E}),
                             ("fetch_order", "1001", SYMBOL, {}),

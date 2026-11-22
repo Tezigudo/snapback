@@ -55,6 +55,8 @@ def run_lsr(monkeypatch, pos, plain, algo, algo_ok, argv=("v1",), dirty=False,
     m = load_lsr()
     c = MagicMock()
     c.fetch_position.return_value = pos
+    # G7: the tool reads strictly; the same mock so `configure` scripts both
+    c.fetch_position_checked = c.fetch_position
     c.ex.fetch_open_orders.return_value = plain
     c.fetch_algo_orders.return_value = (algo, algo_ok)
     c.fetch_equity_usdt.return_value = 100.0
@@ -328,6 +330,10 @@ def test_sl_rejection_client_now_closes_at_market():
     ex.create_order.side_effect = co
     ex.fetch_open_orders.return_value = []
     ex.fapiPrivateGetOpenAlgoOrders.return_value = []
+    # H5: `closed` now requires a CONFIRMED flat after the close — model it
+    ex.fetch_positions.return_value = []
+    ex.fapiPrivateV2GetAccount.return_value = {
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "0"}]}
     c = BinanceClient.__new__(BinanceClient)
     c.ex = ex; c.hedge_mode = False; c.coid_prefix = "snap-v1-"
     c._round_qty = lambda s, q: q
@@ -337,3 +343,25 @@ def test_sl_rejection_client_now_closes_at_market():
     assert ei.value.closed is True
     assert [t for t, _, _ in calls] == ["market", "STOP_MARKET", "market"]
     assert calls[-1] == ("market", True, "snap-v1-123-ns")
+
+
+
+# ---- G7 (round 3): leg_safe_restart refuses on an UNKNOWN position ----------
+def test_lsr_unknown_position_refuses_without_restart(monkeypatch):
+    from exchange.binance_client import PositionUnknown
+
+    def cfg(c):
+        c.fetch_position_checked = MagicMock(side_effect=PositionUnknown("stale empty"))
+    rc, sp, c, _ = run_lsr(monkeypatch, P(), [], [], True, configure=cfg)
+    assert rc == 3 and restarts(sp) == []
+    c.fetch_position.assert_not_called()          # never trusts the lenient read
+
+
+def test_lsr_unknown_on_the_recheck_refuses(monkeypatch):
+    from exchange.binance_client import PositionUnknown
+
+    def cfg(c):
+        c.fetch_position_checked = MagicMock(
+            side_effect=[P(), PositionUnknown("account endpoint down")])
+    rc, sp, _c, _ = run_lsr(monkeypatch, P(), [], [], True, configure=cfg)
+    assert rc == 3 and restarts(sp) == []

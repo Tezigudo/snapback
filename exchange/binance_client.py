@@ -391,18 +391,36 @@ class BinanceClient:
                         entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
 
     def _account_position_amt(self, symbol: str) -> float | None:
-        """Sum of |positionAmt| for `symbol` from GET /fapi/v2/account — an
-        endpoint independent of positionRisk. None when it cannot vouch: no
-        such ccxt method, the call fails, an unexpected shape, or no row for
-        the symbol (V2 lists every symbol, so a missing row is not "flat")."""
-        fetch = getattr(self.ex, "fapiPrivateV2GetAccount", None)
-        if fetch is None:
-            return None
-        try:
-            acct = fetch()
-        except Exception as e:
-            log.warning("account endpoint read failed: %s", e)
-            return None
+        """Sum of |positionAmt| for `symbol` from the futures ACCOUNT endpoint —
+        independent of positionRisk. None = cannot vouch.
+
+        Endpoint (G10, checked against installed ccxt 4.5.54, whose implicit
+        API lists both `fapiPrivateV2GetAccount` and `fapiPrivateV3GetAccount`
+        with no deprecation marker): GET /fapi/v2/account, request WEIGHT 5
+        per Binance's docs (ccxt's internal `cost: 1` is its own throttle unit,
+        not the exchange weight). V2 lists EVERY symbol, zero ones included,
+        so a missing row means "cannot vouch", not "flat".
+        Fallback when V2 is missing or fails: GET /fapi/v3/account (also weight
+        5). V3 lists only symbols with a position or open orders, so there a
+        PRESENT row with positionAmt 0 confirms flat but an ABSENT row is
+        still None — fail-safe (entries stay blocked and G4 escalates) if V2
+        ever disappears.
+        """
+        for name in ("fapiPrivateV2GetAccount", "fapiPrivateV3GetAccount"):
+            fetch = getattr(self.ex, name, None)
+            if fetch is None:
+                continue
+            try:
+                acct = fetch()
+            except Exception as e:
+                log.warning("account endpoint %s read failed: %s", name, e)
+                continue
+            amt = self._amt_from_account(acct, symbol)
+            if amt is not None:
+                return amt
+        return None
+
+    def _amt_from_account(self, acct: Any, symbol: str) -> float | None:
         rows = acct.get("positions") if isinstance(acct, dict) else None
         if not isinstance(rows, list):
             return None
@@ -881,8 +899,10 @@ class BinanceClient:
         pass a fresh one so a reused id cannot hit the duplicate path); sweeps
         still use `root`.
 
-        Only this root's own orders are swept (before AND after the close — a
-        timed-out stop can land late), never the whole prefix.
+        Only this root's own orders are swept, never the whole prefix: its
+        resting entry order before the close, all its legs AFTER a confirmed
+        flat (a timed-out stop can land late). G9: stops are never swept before
+        the close, and not after an unconfirmed one.
         """
         last: BaseException | None = None
         blind = side in ("long", "short") and float(qty or 0) > 0
@@ -906,8 +926,31 @@ class BinanceClient:
                         return True, None, None
                     c_side, c_qty = p.side, p.qty
                 order = self._reduce_only_close(symbol, c_side, c_qty, root, coid_root)
-                self._sweep_root_quietly(symbol, root)
-                return True, order, None
+                # G9: sweep the root's legs only once flat is CONFIRMED; an
+                # unconfirmed close keeps the stops (if any) resting.
+                # H5 (round 4): and report it NOT closed — closed=True made
+                # _finish_no_stop clear the pending record and active_bracket
+                # for a position that may still be open. Two strict reads, 0.5 s
+                # apart (a market fill can lag the position endpoints). No
+                # second close is sent from here: the caller's pending no-stop
+                # retry owns it (a reduce-only re-send cannot overshoot).
+                flat = False
+                for i in range(2):
+                    if i:
+                        time.sleep(0.5)
+                    try:
+                        if self.fetch_position_checked(symbol).side == "flat":
+                            flat = True
+                            break
+                    except Exception as e:
+                        log.warning("post-close flat check failed: %s", e)
+                if flat:
+                    self._sweep_root_quietly(symbol, root)
+                    return True, order, None
+                log.error("EMERGENCY close sent but flat NOT confirmed — root legs "
+                          "kept, reported as not closed")
+                return False, order, RuntimeError(
+                    "emergency close sent but flat not confirmed")
             except Exception as e:
                 last = e
                 log.error("EMERGENCY close attempt %d/%d failed: %s",
@@ -924,9 +967,21 @@ class BinanceClient:
 
     def _reduce_only_close(self, symbol: str, side: str, qty: float,
                            root: str | None, coid_root: str | None = None) -> dict[str, Any]:
-        """Sweep THIS root's legs, then a reduce-only market close of a KNOWN
-        position."""
-        self._sweep_root_quietly(symbol, root)
+        """Reduce-only market close of a KNOWN position.
+
+        G9 (2026-11 round 3): this used to sweep ALL of the root's legs first.
+        The no-stop paths are "no VERIFIED stop", not "no stop": the
+        books-unreadable close (bot._protect_or_close_open) cannot see whether
+        a stop rests, so a pre-close sweep could remove the one protection the
+        position has and then fail to close. Only the root's resting ENTRY
+        order (-e) is cancelled first, so a late entry fill cannot add to the
+        position being closed; stops stay until emergency_close confirms flat.
+        A reduce-only close coexists with resting reduce-only brackets (the
+        live close-first path, _close_then_sweep / breakeven, relies on it)."""
+        try:
+            self.cancel_entry_order(symbol, root)
+        except Exception as e:
+            log.warning("pre-close entry-order cancel failed (closing anyway): %s", e)
         params: dict[str, Any] = {"reduceOnly": True}
         if (coid := _coid(coid_root or root, "ns", self.coid_prefix)):
             params["newClientOrderId"] = coid
@@ -1177,12 +1232,22 @@ class BinanceClient:
 
         # The position is the ground truth for exposure. Read it before any
         # market fallback and bracket THAT qty, not a possibly-stale order read.
+        # G8 (2026-11 round 3): STRICT read. The zero-fill branch below sends a
+        # NON-reduce-only market order, so "flat" must be proven: an unreadable
+        # / stale-empty payload (PositionUnknown) or an opposite-side position
+        # leaves pos_qty None, which refuses the market fallback.
         pos_qty: float | None = None
         try:
-            p = self.fetch_position(symbol)
-            pos_qty = p.qty if p.side == side else 0.0
+            p = self.fetch_position_checked(symbol)
+            if p.side == side:
+                pos_qty = p.qty
+            elif p.side == "flat":
+                pos_qty = 0.0
+            else:
+                log.error("post-cancel read: an OPPOSITE %s %.6f position is open — "
+                          "refusing any market fallback", p.side, p.qty)
         except Exception as e:
-            log.warning("post-cancel fetch_position failed: %s", e)
+            log.warning("post-cancel position read not confirmed: %s", e)
         actual_qty = pos_qty if (pos_qty is not None and pos_qty > 0) else filled_qty
 
         if actual_qty >= qty * 0.999:

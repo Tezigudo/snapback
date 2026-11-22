@@ -115,10 +115,16 @@ def main() -> int:
 
     from exchange.env import load_env_for_instance
     load_env_for_instance(inst)
-    from exchange.binance_client import BinanceClient
+    from exchange.binance_client import BinanceClient, PositionUnknown
 
     c = BinanceClient.from_env()
-    pos = c.fetch_position(symbol)
+    # G7 (2026-11 round 3): strict read — a stale-empty positionRisk used to
+    # read as "flat", and boot() would then flatten the real position.
+    try:
+        pos = c.fetch_position_checked(symbol)
+    except PositionUnknown as e:
+        log(f"[{inst}] position UNKNOWN ({e}) -- refusing (bot NOT touched)")
+        return 3
     if pos.side != "flat" or pos.qty:
         log(f"[{inst}] IN POSITION: {pos.side} qty={pos.qty} @ {pos.entry_price} "
             f"-- refusing (boot() would flatten it)")
@@ -155,7 +161,12 @@ def main() -> int:
             f"-- refusing (bot NOT touched)")
         return 3
     # (b) the exchange: the bot has been free to trade this whole time.
-    pos2 = c.fetch_position(symbol)
+    try:
+        pos2 = c.fetch_position_checked(symbol)
+    except PositionUnknown as e:
+        log(f"[{inst}] position UNKNOWN on the re-check ({e}) -- refusing "
+            f"(bot NOT touched)")
+        return 3
     if pos2.side != "flat" or pos2.qty:
         log(f"[{inst}] opened {pos2.side} qty={pos2.qty} during the check window "
             f"-- refusing (bot NOT touched)")

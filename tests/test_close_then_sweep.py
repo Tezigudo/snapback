@@ -439,3 +439,146 @@ def test_halt_retry_runs_risk_reducing_hooks_only_and_escalates():
     assert not {"breakeven", "enter", "time_stop"} & set(calls)
     urgent = [c for c in alert.call_args_list if c.args[0].startswith("URGENT")]
     assert len(urgent) == 1                            # escalated once, not every tick
+
+
+# --- G11 (round 3): same-bar held stamp rolled back on an unconfirmed time stop
+
+def _same_bar_time_stop_bot(strategy):
+    b, mc = _time_stop_bot()
+    b.strategy_name = strategy
+    b.bar_seconds = 3600
+    return b, mc
+
+
+def test_unconfirmed_time_stop_rolls_back_the_same_bar_stamp():
+    from bot_internals import _TIME_STOP_REENTERS_SAME_BAR
+    strat = sorted(_TIME_STOP_REENTERS_SAME_BAR)[0]
+    b, mc = _same_bar_time_stop_bot(strat)
+    b._position_held_at = None
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    now = 1_800_000_000.0 + 1800                       # mid-bar
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True), \
+         patch("bot.time.time", return_value=now):
+        b._maybe_time_stop(equity=1000.0)
+    assert b._position_held_at == now                  # held NOW, not bar_open - 1
+
+
+def test_confirmed_time_stop_keeps_the_same_bar_stamp():
+    from bot_internals import _TIME_STOP_REENTERS_SAME_BAR
+    strat = sorted(_TIME_STOP_REENTERS_SAME_BAR)[0]
+    b, _mc = _same_bar_time_stop_bot(strat)
+    b._position_held_at = None
+    now = 1_800_000_000.0 + 1800
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True), \
+         patch("bot.time.time", return_value=now):
+        b._maybe_time_stop(equity=1000.0)
+    assert b._position_held_at == (int(now) // 3600) * 3600 - 1
+
+
+# --- H2 (round 4): a RAISING HALT close still runs the hooks + escalation ----
+
+def test_halt_close_raising_runs_risk_hooks_and_escalates():
+    b, mc = _bot()
+    mc.close_position.side_effect = RuntimeError("-2022 ReduceOnly rejected")
+    calls = []
+    b._maybe_finish_no_stop_close = lambda eq: calls.append("no_stop")
+    b._maybe_reprotect = lambda eq: calls.append("reprotect")
+    b._maybe_enter = lambda eq: calls.append("enter")
+    t = [1_000_000.0]
+    ticks = {"n": 0}
+
+    def _sleep(_s):
+        ticks["n"] += 1
+        t[0] += 300.0
+        if ticks["n"] >= 6:
+            b._stopped = True
+    with patch("bot.halt_source", return_value="self"), \
+         patch("bot.send_alert") as alert, patch("bot.time.sleep", side_effect=_sleep), \
+         patch("bot.time.time", side_effect=lambda: t[0]):
+        b.loop()
+    assert "no_stop" in calls and "reprotect" in calls and "enter" not in calls
+    assert sum(1 for c in alert.call_args_list if c.args[0].startswith("URGENT")) == 1
+    mc.cancel_open_orders.assert_not_called()
+
+
+# --- H3 (round 4): the no-stop close finish is None-equity safe --------------
+
+def test_finish_no_stop_with_unknown_equity_still_mails_records_then_clears():
+    import json as _json
+    import sqlite3
+    b, _mc = _bot()
+    rec = {"kind": "no_stop_close", "root": "r1", "side": "long", "qty": 0.01,
+           "entry_price": 65_000.0, "stop_price": None, "why": "t"}
+    b._no_stop_pending = rec
+    state.set_meta(b.NO_STOP_PENDING_KEY, _json.dumps(rec))
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    with patch("bot.send_alert") as alert:
+        b._finish_no_stop("long", 0.01, 65_000.0, "r1", None, closed=True,
+                          order={"id": "1", "average": 64_500.0}, close_error=None,
+                          why="HALT retry reprotect", record_if_flat=True)
+    (mail,) = [c for c in alert.call_args_list if c.args[0] == "NO STOP — position closed"]
+    assert "Equity: unknown" in mail.args[1]
+    assert b._pending_record() is None
+    with sqlite3.connect(state.DB_PATH) as c:
+        row = c.execute("SELECT reason, equity_after FROM fills ORDER BY id DESC LIMIT 1").fetchone()
+    assert row == ("no_stop_close", None)          # never a 0 / stale equity
+
+
+def test_halt_retry_marks_equity_stale_so_nothing_persists_it():
+    b, mc = _bot()
+    b._last_known_equity = 123.0
+    b._equity_stale = False
+    seen = []
+    b._maybe_finish_no_stop_close = lambda eq: seen.append(b._ledger_equity(eq))
+    b._maybe_reprotect = lambda eq: None
+    with patch("bot.send_alert"):
+        b._halt_retry_tick("self data/HALT_v1")
+    assert seen == [None]
+
+
+def test_raising_time_stop_close_also_rolls_back_the_same_bar_stamp():
+    """H4 (round 4): the G11 rollback must run when _close_then_sweep raises."""
+    from bot_internals import _TIME_STOP_REENTERS_SAME_BAR
+    strat = sorted(_TIME_STOP_REENTERS_SAME_BAR)[0]
+    b, mc = _same_bar_time_stop_bot(strat)
+    b._position_held_at = None
+    mc.close_position.side_effect = RuntimeError("timeout")
+    now = 1_800_000_000.0 + 1800
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True), \
+         patch("bot.time.time", return_value=now):
+        b._maybe_time_stop(equity=1000.0)            # the hook swallows the raise
+    assert b._position_held_at == now
+
+
+
+def test_exit_found_flat_never_persists_zero_or_stale_equity():
+    """Round 4 check of G3: with equity unknown, the booked exit has NULL
+    equity_after (not 0.0), and the mail says 'unknown'."""
+    import sqlite3
+
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+    b._last_known_equity = None
+    b._equity_stale = False
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.send_alert") as alert, patch("bot.state.enqueue_bot_event") as ev:
+        b._exit_found_flat("HALT")
+    with sqlite3.connect(state.DB_PATH) as c:
+        row = c.execute("SELECT reason, equity_after FROM fills ORDER BY id DESC LIMIT 1").fetchone()
+    assert row == ("bracket_exit", None)
+    assert all(c.kwargs.get("equity_usd") is None for c in ev.call_args_list)
+    exit_mails = [c.args[1] for c in alert.call_args_list if "exit" in c.args[0].lower()]
+    assert exit_mails and "Equity now: $unknown" in exit_mails[0]
