@@ -173,6 +173,8 @@ class TestBracketStateMergesBothBooks:
 
 from unittest.mock import MagicMock, patch  # noqa: E402
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 from exchange.binance_client import Position  # noqa: E402
 
 _PARAMS: dict = {
@@ -210,6 +212,7 @@ def _bot(reprotect: dict | None = None, algo_rows=(), plain_orders=(),
     mc.fetch_position.return_value = _OPEN
     mc.ex.fetch_open_orders.return_value = list(plain_orders)
     mc.fetch_algo_orders.return_value = (list(algo_rows), readable)
+    agree_on_flat(mc, set_algo=False)
     with patch("bot.BinanceClient.from_env", return_value=mc):
         b = Bot(params=params, dry_run=False)
     return b, mc
@@ -310,6 +313,9 @@ class TestMaybeReprotectBrakes:
         active_bracket, so it went stale after every trade while disabled."""
         bot, mc = _bot()
         mc.fetch_position.return_value = _FLAT
-        with patch("bot.state.set_meta") as set_meta:
-            bot._maybe_reprotect(equity=147.0)
+        with patch("bot.state.get_meta", return_value=json.dumps(_BRACKET)), \
+             patch("bot.state.set_meta") as set_meta:
+            bot._maybe_reprotect(equity=147.0)   # 1st flat tick: unconfirmed (N1)
+            set_meta.assert_not_called()
+            bot._maybe_reprotect(equity=147.0)   # 2nd consecutive flat: confirmed
         set_meta.assert_called_once_with("active_bracket", "")

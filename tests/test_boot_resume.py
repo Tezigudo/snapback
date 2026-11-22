@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 import pytest
 
 from exchange.binance_client import Position
@@ -85,6 +87,7 @@ def _mock_client(coid_prefix: str = "snap-v1-") -> MagicMock:
          "side": "SELL", "triggerPrice": "67000.0", "strategyType": None,
          "reduceOnly": True, "algoStatus": "NEW"},
     ], True)
+    agree_on_flat(mc, set_algo=False)
     return mc
 
 

@@ -117,3 +117,4 @@ def fixture_risk_ceilings():
     _risk._ACTIVE = FIXTURE_CEILINGS
     yield FIXTURE_CEILINGS
     _risk._ACTIVE = FIXTURE_CEILINGS
+

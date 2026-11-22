@@ -11,6 +11,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -41,7 +43,7 @@ class Harness:
         b.instance, b.symbol, b.entry_tf, b.bar_seconds = "v1", "BTC/USDT:USDT", "15m", 900
         b.strategy_name, b.params = "multifactor-v1", {}
         b.log = logging.getLogger("test_stale_bar_reentry")
-        b.client = MagicMock()
+        b.client = agree_on_flat(MagicMock())
         b._entry_blocked = lambda: False
         b._entries_paused = lambda: False
         b._daily_loss_blocks_entry = lambda equity: False

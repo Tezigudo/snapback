@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 import pytest
 
 from bot_internals import SignalDecision
@@ -48,6 +50,7 @@ def _mock_client(coid_prefix: str = "snap-v1-") -> MagicMock:
     mc.coid_prefix = coid_prefix
     mc.env = "testnet"
     mc.cancel_open_orders.return_value = 0
+    agree_on_flat(mc)  # a flat edge confirms on the same tick (stop gone)
     return mc
 
 

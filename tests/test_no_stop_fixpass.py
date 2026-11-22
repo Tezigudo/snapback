@@ -68,7 +68,12 @@ class TestItem1StalePendingNeverTouchesAnotherPosition:
         bot, ex = _pending_after_failed_close()
         ex.pos = None
         with patch("bot.send_alert") as alert:
+            # 2026-11 (N1): the first flat tick is unconfirmed — the pending
+            # close is kept and no "now flat" mail goes out
             bot._maybe_finish_no_stop_close(150.0)
+            assert bot._pending_record() is not None
+            assert not any("flat" in s.lower() for s in _subjects(alert))
+            bot._maybe_finish_no_stop_close(150.0)   # flat again: confirmed
         assert bot._pending_record() is None
         assert state.get_meta("no_stop_close_pending") == ""
         assert ex.closes() == [] or all(c for c in ex.closes())

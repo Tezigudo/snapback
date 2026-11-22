@@ -26,6 +26,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from tests._flat_confirm import agree_on_flat  # noqa: E402
+
 import pandas as pd
 import pytest
 
@@ -96,7 +98,7 @@ def _make_bot():
     b.entry_tf = "4h"
     b.bar_seconds = 4 * 3600
     b.dry_run = False
-    b.client = MagicMock()
+    b.client = agree_on_flat(MagicMock())
     b.client.fetch_ohlcv.return_value = pd.DataFrame()   # len<250 → returns
     for name in ("_heartbeat", "_maybe_reconcile_principal", "_detect_bracket_exit",
                  "_maybe_time_stop", "_maybe_channel_exit", "_maybe_breakeven",
@@ -629,6 +631,10 @@ def test_real_bracket_fill_is_not_flagged_as_a_transfer(db):
     _ready_principal()
     del b._detect_bracket_exit                      # use the real one
     b.coid_prefix, b.base_asset = "snap-v1-", "BTC"
+    # The flat-edge pricing reads these. Before 2026-11 this harness lacked
+    # _exit_retry_n, so the detector raised out of the tick and the test
+    # passed without the live-equity writer ever running.
+    b.constraints = bot_mod.DEFAULT_CONSTRAINTS
     b._last_position_side, b._last_position_entry = "unknown", None
     b._last_position_qty, b._last_entry_root = None, None
     b.client.ex.fetch_my_trades.return_value = [

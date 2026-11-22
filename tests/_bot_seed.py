@@ -27,3 +27,5 @@ def seed_no_stop_state(b, bot_cls) -> None:
     b._pause_alert_retry_at = 0.0
     b._pause_alert_tries = 0
     b._position_held_at = None
+    b._flat_seen = {}  # bot._confirm_flat per-site counters (2026-11)
+    b._exit_retry_n = 0
