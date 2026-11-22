@@ -50,7 +50,7 @@ def _bot(*, wallet_now: float, pos_side="long", pos_qty=0.01):
     b._prev_tick_wallet, b._prev_tick_equity = 300.0, 300.0
     b.client = MagicMock()
     b.client.last_wallet_usdt = wallet_now
-    b.client.fetch_position.return_value = SimpleNamespace(side=pos_side, qty=pos_qty)
+    b.client.fetch_position_checked.return_value = SimpleNamespace(side=pos_side, qty=pos_qty)
     # the real kill action is replaced by "would it fire on the CURRENT anchor"
     b._check_kill_switch = MagicMock(
         side_effect=lambda eq: principal_mod.breached(eq, principal_mod.get_principal(), KF))
@@ -99,6 +99,31 @@ def test_ledger_lagging_defers_then_kills_when_the_grace_expires(P):
         t[0] += b.TRANSFER_SUSPECT_MAX_S
         assert b._kill_switch_after_reconcile(150.0) is True      # bounded
     assert P.reconciles == 3                                      # every breach tick
+
+
+def test_withdrawal_booked_this_tick_is_not_counted_again_as_unbooked(P):
+    """sourcery 4657581919: 150 withdrawn AND a price loss; the same-tick
+    reconcile books the 150 (P2=150, floor 96.75). Equity 90 still breaches
+    P2, but old code added the raw wallet drop back (90+150 > 96.75) and
+    deferred. The booked part is already in P2: the kill fires, no DEFERRED."""
+    def _book(pr):
+        pr.p = 150.0
+        pr.ledger["sum"] = 150.0
+    P.on_reconcile = _book
+    b = _bot(wallet_now=150.0)
+    assert b._kill_switch_after_reconcile(90.0) is True
+    assert b._kill_grace is None
+    assert not any("DEFERRED" in c.args[0] for c in P.alert.call_args_list)
+
+
+def test_unverified_position_read_during_grace_check_kills(P):
+    """sourcery 4657581932: the grace uses the strict read; PositionUnknown
+    means no deferral."""
+    from exchange.binance_client import PositionUnknown
+    b = _bot(wallet_now=150.0)
+    b.client.fetch_position_checked.side_effect = PositionUnknown("garbled")
+    assert b._kill_switch_after_reconcile(150.0) is True
+    assert b._kill_grace is None
 
 
 def test_same_wallet_drop_with_the_position_now_flat_kills_at_once(P):
@@ -174,7 +199,7 @@ def test_loop_withdrawal_grace_defers_then_kills_on_a_real_breach(P):
     b._prev_tick_fingerprint = ("long", 0.01, 7)
     b._prev_tick_wallet, b._prev_tick_equity = 300.0, 300.0
     b._persist_live_equity = MagicMock()          # keep _prev_tick_* as seeded
-    b.client.fetch_position.return_value = SimpleNamespace(side="long", qty=0.01)
+    b.client.fetch_position_checked.return_value = SimpleNamespace(side="long", qty=0.01)
     seq = iter([(150.0, 150.0), (40.0, 150.0)])    # (equity, wallet) per tick
 
     def _equity():

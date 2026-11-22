@@ -1091,8 +1091,13 @@ class Bot:
             except Exception as e:
                 self.log.warning("kill pre-check: principal reconcile failed: %s", e)
             P2 = principal.get_principal()
+            # a withdrawal booked by THIS reconcile is already in P2: do not
+            # count the same wallet drop again as "unbooked" (sourcery 4657581919)
+            booked = (float(P) - float(P2)
+                      if isinstance(P, (int, float)) and isinstance(P2, (int, float))
+                      else 0.0)
             if principal.breached(equity, P2, self.kill_fraction) and \
-                    self._withdrawal_grace(equity, P2):
+                    self._withdrawal_grace(equity, P2, booked):
                 return False
         except Exception as e:
             # The pre-check must never stand between the leg and its kill
@@ -1101,7 +1106,8 @@ class Bot:
             self._kill_grace = None
         return self._check_kill_switch(equity)
 
-    def _withdrawal_grace(self, equity: float, P: float | None) -> bool:
+    def _withdrawal_grace(self, equity: float, P: float | None,
+                          booked: float = 0.0) -> bool:
         """True = defer the kill THIS tick: the breach is explained by a wallet
         drop that is (a) unexplained by any position change or fill, (b) not yet
         in the principal ledger, and (c) without which equity is NOT breached.
@@ -1114,7 +1120,7 @@ class Bot:
             ledger = state.principal_ledger_sum(principal.PRINCIPAL_ASSET,
                                                 self.LAST_BAR_PERSIST_TIMEOUT_S)
             fill_id = state.max_fill_id(self.LAST_BAR_PERSIST_TIMEOUT_S)
-            pos = self.client.fetch_position(self.symbol)
+            pos = self.client.fetch_position_checked(self.symbol)
             snap_side = getattr(self, "_last_position_side", None)
             snap_qty = getattr(self, "_last_position_qty", None)
             if snap_side in (None, "unknown"):
@@ -1140,7 +1146,7 @@ class Bot:
                         and isinstance(prev_wallet, (int, float))
                         and prev_eq and prev_eq > 0):
                     return False
-                residual = float(wallet) - float(prev_wallet)
+                residual = float(wallet) - float(prev_wallet) + booked
                 if residual >= -self.TRANSFER_JUMP_FRAC * prev_eq:
                     return False   # not a withdrawal-sized unexplained drop
             if principal.breached(equity - residual, P, self.kill_fraction):
