@@ -330,6 +330,10 @@ def test_sl_rejection_client_now_closes_at_market():
     ex.create_order.side_effect = co
     ex.fetch_open_orders.return_value = []
     ex.fapiPrivateGetOpenAlgoOrders.return_value = []
+    # H5: `closed` now requires a CONFIRMED flat after the close — model it
+    ex.fetch_positions.return_value = []
+    ex.fapiPrivateV2GetAccount.return_value = {
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "0"}]}
     c = BinanceClient.__new__(BinanceClient)
     c.ex = ex; c.hedge_mode = False; c.coid_prefix = "snap-v1-"
     c._round_qty = lambda s, q: q

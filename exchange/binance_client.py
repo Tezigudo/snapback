@@ -928,14 +928,29 @@ class BinanceClient:
                 order = self._reduce_only_close(symbol, c_side, c_qty, root, coid_root)
                 # G9: sweep the root's legs only once flat is CONFIRMED; an
                 # unconfirmed close keeps the stops (if any) resting.
-                try:
-                    flat = self.fetch_position_checked(symbol).side == "flat"
-                except Exception as e:
-                    log.warning("post-close flat check failed — root legs kept: %s", e)
-                    flat = False
+                # H5 (round 4): and report it NOT closed — closed=True made
+                # _finish_no_stop clear the pending record and active_bracket
+                # for a position that may still be open. Two strict reads, 0.5 s
+                # apart (a market fill can lag the position endpoints). No
+                # second close is sent from here: the caller's pending no-stop
+                # retry owns it (a reduce-only re-send cannot overshoot).
+                flat = False
+                for i in range(2):
+                    if i:
+                        time.sleep(0.5)
+                    try:
+                        if self.fetch_position_checked(symbol).side == "flat":
+                            flat = True
+                            break
+                    except Exception as e:
+                        log.warning("post-close flat check failed: %s", e)
                 if flat:
                     self._sweep_root_quietly(symbol, root)
-                return True, order, None
+                    return True, order, None
+                log.error("EMERGENCY close sent but flat NOT confirmed — root legs "
+                          "kept, reported as not closed")
+                return False, order, RuntimeError(
+                    "emergency close sent but flat not confirmed")
             except Exception as e:
                 last = e
                 log.error("EMERGENCY close attempt %d/%d failed: %s",
