@@ -466,6 +466,7 @@ class Bot:
         self._prev_tick_fingerprint: tuple | None = None
         self._prev_tick_wallet: float | None = None
         self._transfer_suspect: dict | None = None
+        self._kill_grace: dict | None = None   # _withdrawal_grace (2026-11)
         # One alert per process when the per-position re-place cap is hit — the
         # cap itself is persisted in active_bracket; this only de-dupes the mail.
         self._reprotect_capped_alerted: bool = False
@@ -957,6 +958,118 @@ class Bot:
             f"bot will exit.",
         )
         return True
+
+    # --- kill switch vs. an unreconciled withdrawal (2026-11 review) --------
+    def _kill_switch_after_reconcile(self, equity: float) -> bool:
+        """The kill check, with the principal brought up to date FIRST.
+
+        Before: the kill check ran on the hourly-reconciled principal, ahead of
+        the transfer detector, so a withdrawal larger than the cushion
+        (1 − kill_fraction) flattened and HALTed the leg (v1, 2026-11-04).
+
+        Now, ONLY when the current anchor says "breached":
+          1. reconcile the principal from the income ledger NOW (bypassing the
+             hourly throttle) and re-evaluate on the fresh anchor;
+          2. if still breached, a bounded exemption for a wallet drop the
+             ledger has not caught up with (_withdrawal_grace). It never applies
+             when the position or the fills changed, when the wallet was not
+             read this tick, or when the drawdown breaches even with the
+             unexplained drop added back — those all kill exactly as before.
+        A non-breach is untouched: _check_kill_switch runs as always (it also
+        owns the "anchor unset" alert).
+        """
+        try:
+            P = principal.get_principal()
+            if not principal.breached(equity, P, self.kill_fraction):
+                self._kill_grace = None
+                return self._check_kill_switch(equity)
+            try:
+                if principal.is_initialized():
+                    principal.reconcile_recent(self.client, log=self.log)
+                    self._last_principal_reconcile_ts = time.time()
+            except Exception as e:
+                self.log.warning("kill pre-check: principal reconcile failed: %s", e)
+            P2 = principal.get_principal()
+            if principal.breached(equity, P2, self.kill_fraction) and \
+                    self._withdrawal_grace(equity, P2):
+                return False
+        except Exception as e:
+            # The pre-check must never stand between the leg and its kill
+            # switch: on any error, the unchanged check decides.
+            self.log.warning("kill pre-check failed (plain kill check runs): %s", e)
+            self._kill_grace = None
+        return self._check_kill_switch(equity)
+
+    def _withdrawal_grace(self, equity: float, P: float | None) -> bool:
+        """True = defer the kill THIS tick: the breach is explained by a wallet
+        drop that is (a) unexplained by any position change or fill, (b) not yet
+        in the principal ledger, and (c) without which equity is NOT breached.
+        Bounded by TRANSFER_SUSPECT_MAX_S from the first deferral, and ends the
+        moment the ledger sum moves (the transfer landed → the normal check on
+        the reconciled anchor decides). Fails toward the kill on any missing
+        read. Mails once per grace."""
+        try:
+            now = time.time()
+            ledger = state.principal_ledger_sum(principal.PRINCIPAL_ASSET,
+                                                self.LAST_BAR_PERSIST_TIMEOUT_S)
+            fill_id = state.max_fill_id(self.LAST_BAR_PERSIST_TIMEOUT_S)
+            pos = self.client.fetch_position(self.symbol)
+            snap_side = getattr(self, "_last_position_side", None)
+            snap_qty = getattr(self, "_last_position_qty", None)
+            if snap_side in (None, "unknown"):
+                return False
+            same_pos = (pos.side == snap_side) and (
+                pos.side == "flat"
+                or (snap_qty is not None and abs(float(pos.qty) - float(snap_qty)) <= 1e-12))
+            g = getattr(self, "_kill_grace", None)
+            if g is not None:
+                if (now - g["since"] > self.TRANSFER_SUSPECT_MAX_S
+                        or ledger != g["ledger_sum"] or fill_id != g["fill_id"]
+                        or (pos.side, float(pos.qty or 0.0)) != g["pos"]):
+                    self._kill_grace = None
+                    return False
+                residual = g["residual"]
+            else:
+                prev_fp = getattr(self, "_prev_tick_fingerprint", None)
+                prev_wallet = getattr(self, "_prev_tick_wallet", None)
+                prev_eq = getattr(self, "_prev_tick_equity", None)
+                wallet = getattr(self.client, "last_wallet_usdt", None)
+                if not (same_pos and prev_fp is not None and fill_id == prev_fp[2]
+                        and isinstance(wallet, (int, float)) and math.isfinite(wallet)
+                        and isinstance(prev_wallet, (int, float))
+                        and prev_eq and prev_eq > 0):
+                    return False
+                residual = float(wallet) - float(prev_wallet)
+                if residual >= -self.TRANSFER_JUMP_FRAC * prev_eq:
+                    return False   # not a withdrawal-sized unexplained drop
+            if principal.breached(equity - residual, P, self.kill_fraction):
+                self._kill_grace = None
+                return False       # the drawdown breaches on its own: kill
+            if g is None:
+                self._kill_grace = {"since": now, "residual": residual,
+                                    "ledger_sum": ledger, "fill_id": fill_id,
+                                    "pos": (pos.side, float(pos.qty or 0.0))}
+                self.log.warning(
+                    "kill switch DEFERRED: equity %.2f breaches the floor only "
+                    "because of an unexplained wallet drop of %.2f USDT (no "
+                    "position change or fill) that the income ledger has not "
+                    "booked yet — likely a withdrawal. Reconciling and "
+                    "re-checking each tick for up to %.0fs.", equity, residual, self.TRANSFER_SUSPECT_MAX_S)
+                send_alert(
+                    f"{self.instance}: kill switch DEFERRED (possible withdrawal)",
+                    f"Equity {equity:.2f} is below the kill floor only because the "
+                    f"wallet dropped {residual:+.2f} USDT with no position change or "
+                    f"fill, and the income ledger has not booked it yet. The kill "
+                    f"switch is held for at most {self.TRANSFER_SUSPECT_MAX_S:.0f}s "
+                    f"while the principal reconciles every tick; it fires at once if "
+                    f"the drawdown breaches without that drop, or if anything else "
+                    f"changes.")
+            return True
+        except Exception as e:
+            self.log.warning("kill pre-check: withdrawal grace check failed "
+                             "(kill proceeds): %s", e)
+            self._kill_grace = None
+            return False
 
     def _maybe_reconcile_principal(self) -> None:
         """Periodically refresh the principal anchor from the Binance income
@@ -4559,7 +4672,7 @@ class Bot:
                     # (flat OR holding); the monitor's live-equity feed follows
                     # _detect_bracket_exit below. Never on a guessed equity.
                     self._roll_daily_anchor(equity)
-                if equity_known and self._check_kill_switch(equity):
+                if equity_known and self._kill_switch_after_reconcile(equity):
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries (the
