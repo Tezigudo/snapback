@@ -4460,15 +4460,20 @@ class Bot:
                         (int(now) // self.bar_seconds) * self.bar_seconds - 1)
                 else:
                     self._note_held(now)
-                order, flat = self._close_then_sweep(root, "x", "time-stop")
-                if order is None or not flat:
-                    # G11: the same-bar stamp above is only valid for a time
-                    # stop that actually closed the position. Unconfirmed (it
-                    # may still be open) or not ours (an SL/TP got there
-                    # first): restore the previous stamp and mark the position
-                    # held NOW, so no entry can treat this bar as freed.
-                    self._position_held_at = held_before
-                    self._note_held(now)
+                confirmed = False
+                try:
+                    order, flat = self._close_then_sweep(root, "x", "time-stop")
+                    confirmed = order is not None and flat
+                finally:
+                    if not confirmed:
+                        # G11 (+H4: also when the close RAISES): the same-bar
+                        # stamp above is only valid for a time stop that
+                        # actually closed the position. Otherwise restore the
+                        # previous stamp and mark the position held NOW, so no
+                        # entry can treat this bar as freed.
+                        self._position_held_at = held_before
+                        self._note_held(now)
+                if not confirmed:
                     # F2: book NOTHING. None = nothing was sent (already flat:
                     # an SL/TP got there first); not flat = close-failed alert
                     # already sent, the position may still be open. Either way
