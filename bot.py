@@ -111,6 +111,7 @@ from exchange.env import (
 from risk import (
     RiskBreach,
     check_daily_loss,
+    clamp_qty_to_notional_cap,
     check_leverage,
     check_notional,
     check_symbol,
@@ -1655,11 +1656,24 @@ class Bot:
         )
         notional = qty * decision.price
 
+        # Notional cap: RESIZE, do not skip (2026-11, God approved). Stop and
+        # TP prices are unchanged, so effective risk = target × (capped/intended)
+        # < target. A size the clamp pushes under the exchange minimum is
+        # skipped by the minimums check right below, as before.
+        intended_qty, intended_notional = qty, notional
+        qty, clamped = clamp_qty_to_notional_cap(
+            qty, decision.price, self.constraints.qty_step)
+        if clamped:
+            notional = qty * decision.price
+
         # Exchange minimums (min qty + min notional) come from the live market
         # spec — tighter than our own caps. If a signal can't be filled, SKIP
         # it. Do NOT scale up to meet the minimum; that would violate the
         # risk budget.
         ok, reason = passes_minimums(qty, decision.price, self.constraints)
+        if not ok and clamped:
+            reason = (f"{reason} after resizing to the notional cap "
+                      f"(intended ${intended_notional:,.2f})")
         if not ok:
             self.log.warning("Skipping %s signal: %s (equity=$%.2f). "
                              "Need more capital or accept smaller positions.",
@@ -1670,10 +1684,13 @@ class Bot:
             return
 
         try:
-            check_notional(notional)
+            check_notional(notional)   # backstop: after the clamp this cannot trip
         except RiskBreach as e:
             self.log.warning("Skipping signal: %s", e)
             return
+        if clamped:
+            self._note_notional_resize(decision.side, intended_qty, intended_notional,
+                                       qty, notional, equity)
 
         # signal_id anchors all 3 legs of this trade on Binance via clientOrderId.
         # Format: snap-v1-<signal_id>-{e|s|t|x|bf|h|k}. Investing-consolidate's
@@ -1881,6 +1898,30 @@ class Bot:
     def _clear_unverified(self) -> None:
         self._unverified = None
         self._unverified_meta_stale = not self._set_meta_quietly(self.UNVERIFIED_KEY, "")
+
+    def _note_notional_resize(self, side: str, intended_qty: float,
+                              intended_notional: float, qty: float,
+                              notional: float, equity: float) -> None:
+        """Log + alert a signal resized to MAX_NOTIONAL_USD. Never raises."""
+        try:
+            frac = (qty / intended_qty) if intended_qty > 0 else 0.0
+            eff_risk = float(self.risk_pct) * frac
+            msg = (f"{self.instance}: {side} signal RESIZED to the notional cap — "
+                   f"intended {intended_qty:.6f} {self.base_asset} "
+                   f"(${intended_notional:,.2f}) -> {qty:.6f} (${notional:,.2f}); "
+                   f"effective risk {eff_risk:.2f}% of equity ${equity:,.2f} "
+                   f"(target {float(self.risk_pct):.2f}%). Stop/TP prices unchanged.")
+            self.log.warning("%s", msg)
+            state.record_event("WARN", "signal_resized_notional_cap",
+                               {"side": side, "intended_qty": intended_qty,
+                                "intended_notional": intended_notional,
+                                "qty": qty, "notional": notional,
+                                "effective_risk_pct": eff_risk,
+                                "target_risk_pct": float(self.risk_pct)})
+            if not self.dry_run:
+                send_alert(f"{self.instance}: entry resized to notional cap", msg)
+        except Exception:
+            self.log.exception("notional-cap resize note failed")
 
     def _entry_blocked(self) -> bool:
         """Fails CLOSED: an unreadable record blocks entries (the safe side)."""
