@@ -86,6 +86,7 @@ def test_none_return_on_a_false_flat_sweeps_nothing():
     b, mc = _bot()
     mc.close_position.side_effect = None
     mc.close_position.return_value = None
+    mc.close_from_account_amt.return_value = None   # account flat/unreadable too
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
     with patch("bot.send_alert") as alert:
@@ -711,3 +712,32 @@ def test_time_stop_close_with_unknown_fill_price_books_nothing():
     with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True):
         b._maybe_time_stop(equity=1000.0)
     assert "time_stop" not in _reasons()
+
+
+def test_halt_sends_an_account_sized_reduce_only_close_when_positionrisk_has_no_row():
+    # sourcery 4657584898
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None              # lenient read: no row
+    mc.close_from_account_amt.return_value = {"id": "9"}
+    mc.fetch_position_checked.side_effect = lambda *a, **k: (
+        _open("flat", 0.0, 0.0) if mc.close_from_account_amt.called
+        else _open("long", 65_000.0, 0.01))
+    order, flat = b._close_then_sweep("r1", "h", "HALT")
+    mc.close_from_account_amt.assert_called_once()
+    assert order == {"id": "9"}
+
+
+def test_client_close_from_account_amt_is_reduce_only_and_signed():
+    from exchange.binance_client import BinanceClient
+    ex = MagicMock()
+    ex.market.return_value = {"id": "BTCUSDT"}
+    ex.fapiPrivateV2GetAccount.return_value = {
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": "-0.010"}]}
+    ex.create_order.return_value = {"id": "1"}
+    c = BinanceClient(ex=ex, env="testnet", coid_prefix="snap-v1-")
+    c.close_from_account_amt("BTC/USDT:USDT", "r1", "h")
+    args = ex.create_order.call_args.args
+    assert args[2] == "buy" and args[3] == 0.01
+    assert ex.create_order.call_args.args[-1]["reduceOnly"] is True \
+        if len(args) > 5 else ex.create_order.call_args.kwargs["params"]["reduceOnly"]

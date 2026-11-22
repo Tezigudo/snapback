@@ -4977,6 +4977,19 @@ class Bot:
                                      f"next pass; check Binance.")
             raise
         flat, last = self._strict_flat_reads()
+        if order is None and not flat and close_leg in ("h", "k"):
+            # sourcery 4657584898: the lenient read saw no position but the strict
+            # read does not confirm flat (e.g. positionRisk has no row while the
+            # account endpoint shows one): HALT/kill must still send a close.
+            try:
+                order = self.client.close_from_account_amt(self.symbol, root, close_leg)
+            except Exception as e:
+                self._alert_close_failed(close_leg, why,
+                                         f"the account-sized reduce-only close RAISED: "
+                                         f"{e!r}. Stops still resting; the bot retries.")
+                raise
+            if order is not None:
+                flat, last = self._strict_flat_reads()
         if order is None:
             # close_position sent NOTHING because its own lenient read said
             # flat — the same single read N1 is about. Sweep nothing here;

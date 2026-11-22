@@ -394,7 +394,7 @@ class BinanceClient:
         return Position(symbol=symbol, side="flat", qty=0.0,
                         entry_price=0.0, unrealized_pnl=0.0, margin_used=0.0)
 
-    def _account_position_amt(self, symbol: str) -> float | None:
+    def _account_position_amt(self, symbol: str, signed: bool = False) -> float | None:
         """Sum of |positionAmt| for `symbol` from the futures ACCOUNT endpoint —
         independent of positionRisk. None = cannot vouch.
 
@@ -419,12 +419,13 @@ class BinanceClient:
             except Exception as e:
                 log.warning("account endpoint %s read failed: %s", name, e)
                 continue
-            amt = self._amt_from_account(acct, symbol)
+            amt = self._amt_from_account(acct, symbol, signed)
             if amt is not None:
                 return amt
         return None
 
-    def _amt_from_account(self, acct: Any, symbol: str) -> float | None:
+    def _amt_from_account(self, acct: Any, symbol: str,
+                          signed: bool = False) -> float | None:
         rows = acct.get("positions") if isinstance(acct, dict) else None
         if not isinstance(rows, list):
             return None
@@ -440,7 +441,7 @@ class BinanceClient:
             if not math.isfinite(amt):
                 return None
             matched = True
-            total += abs(amt)
+            total += amt if signed else abs(amt)
         return total if matched else None
 
     # --- order management ---------------------------------------------------
@@ -1459,6 +1460,22 @@ class BinanceClient:
             params["positionSide"] = pos_side
         return self._create_order_with_coid_retry(
             symbol, "market", ccxt_side, p.qty, None, params)
+
+    def close_from_account_amt(self, symbol: str, client_order_id_root: str | None,
+                               close_leg: str) -> dict[str, Any] | None:
+        """HALT/kill fallback (sourcery 4657584898): positionRisk showed no
+        usable row (so close_position sent nothing) while the independent
+        ACCOUNT endpoint shows a position. Send a REDUCE-ONLY market close sized
+        from the signed account amount; reduce-only means a wrong side is
+        rejected, never opened. None = account flat or unreadable."""
+        amt = self._account_position_amt(symbol, signed=True)
+        if not amt:
+            return None
+        params: dict[str, Any] = {"reduceOnly": True}
+        if (coid := _coid(client_order_id_root, close_leg, self.coid_prefix)):
+            params["newClientOrderId"] = coid
+        return self._create_order_with_coid_retry(
+            symbol, "market", "sell" if amt > 0 else "buy", abs(amt), None, params)
 
     def __repr__(self) -> str:
         return f"BinanceClient(env={self.env!r}, api_key='***')"
