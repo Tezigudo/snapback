@@ -1835,6 +1835,7 @@ class Bot:
                 orders=orders, dbg=decision.debug,
             )
             self._alert_tp_error(orders, decision.side, signal_id)
+            self._record_tp_placed(orders, signal_id, place_tp)
             self._note_protected_entry()
             return
 
@@ -1856,6 +1857,7 @@ class Bot:
             orders=orders, dbg=decision.debug,
         )
         self._alert_tp_error(orders, decision.side, signal_id)
+        self._record_tp_placed(orders, signal_id, place_tp)
         self._note_protected_entry()
 
     # --- no-stop handling (God's rule, 2026-10-13) ---------------------------
@@ -3296,6 +3298,28 @@ class Bot:
     FLAT_UNKNOWN_ERROR_TICKS = 5  # unreadable re-reads in a row before it logs ERROR
     BRACKET_SITE = "bracket_exit"
 
+    TP_PLACED_KEY = "tp_placed_root"
+
+    def _tp_was_placed(self) -> bool:
+        """Was a TP recorded as placed for the position being tracked? Fails
+        toward False (no fill evidence → the debounce decides)."""
+        root = getattr(self, "_last_entry_root", None)
+        if not root:
+            return False
+        try:
+            return state.get_meta(self.TP_PLACED_KEY) == str(root)
+        except Exception:
+            return False
+
+    def _record_tp_placed(self, orders: dict | None, signal_id: str,
+                          place_tp: bool) -> None:
+        """At entry: remember the root whose TP really rests (F6). Never raises."""
+        try:
+            ok = bool(place_tp) and not (orders or {}).get("tp_error")
+            state.set_meta(self.TP_PLACED_KEY, str(signal_id) if ok else "")
+        except Exception:
+            self.log.exception("tp-placed bookkeeping failed")
+
     def _flat_pending(self, site: str) -> bool:
         return self._flat_seen.get(site, 0) > 0
 
@@ -3350,9 +3374,14 @@ class Bot:
             rows, ok = self.client.fetch_algo_orders(self.symbol)
             if ok:
                 legs = {algo_bracket_leg(r, self.coid_prefix) for r in rows}
+                # F6: only a leg the position is KNOWN to have had can count as
+                # "filled" by going missing. The SL always exists (no SL = the
+                # no-stop rule closed it). A missing TP is evidence only if
+                # this position's TP was recorded as PLACED: the TP can fail
+                # ("stop is resting, position kept") or be cancelled by hand,
+                # and must not then bypass the debounce.
                 intact = "sl" in legs and (
-                    "tp" in legs
-                    or strategy_uses_channel_exit(self.strategy_name))  # no TP placed
+                    "tp" in legs or not self._tp_was_placed())
             if intact is False:
                 self._flat_clear(site)
                 return True
