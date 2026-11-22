@@ -407,3 +407,35 @@ def test_kill_found_flat_with_unbookable_exit_alerts_reconcile():
               if "kill-switch found the position already flat" in c.args[0]]
     assert bodies and "NOT in the ledger" in bodies[0]
     mc.cancel_open_orders.assert_called_once()
+
+
+# --- G5 (round 3): HALT retry loop keeps managing risk, escalates ------------
+
+def test_halt_retry_runs_risk_reducing_hooks_only_and_escalates():
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = {"id": "1"}
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
+    calls = []
+    b._maybe_finish_no_stop_close = lambda eq: calls.append("no_stop")
+    b._maybe_reprotect = lambda eq: calls.append("reprotect")
+    b._maybe_breakeven = lambda eq: calls.append("breakeven")
+    b._maybe_enter = lambda eq: calls.append("enter")
+    b._maybe_time_stop = lambda eq: calls.append("time_stop")
+    t = [1_000_000.0]
+    ticks = {"n": 0}
+
+    def _sleep(_s):
+        ticks["n"] += 1
+        t[0] += 300.0                                  # 5 min per retry
+        if ticks["n"] >= 6:
+            b._stopped = True
+    with patch("bot.halt_source", return_value="self"), \
+         patch("bot.send_alert") as alert, patch("bot.time.sleep", side_effect=_sleep), \
+         patch("bot.time.time", side_effect=lambda: t[0]):
+        b.loop()
+    assert "no_stop" in calls and "reprotect" in calls
+    assert not {"breakeven", "enter", "time_stop"} & set(calls)
+    urgent = [c for c in alert.call_args_list if c.args[0].startswith("URGENT")]
+    assert len(urgent) == 1                            # escalated once, not every tick

@@ -4828,6 +4828,42 @@ class Bot:
             self.log.exception("%s close: post-close sweep failed", why)
         return order, True
 
+    HALT_UNCONFIRMED_ESCALATE_S = 600.0   # G5: louder alert after this long
+
+    def _halt_retry_tick(self, which: str) -> None:
+        """G5 (round 3): one HALT retry iteration with flat still unconfirmed.
+        Runs the risk-REDUCING hooks only — the pending no-stop close and
+        reprotect (re-places a missing stop where enabled). No entries, no
+        breakeven (it moves stops), no trend/time exits (the HALT close is
+        already the exit). Escalates ONCE after HALT_UNCONFIRMED_ESCALATE_S.
+        NEVER raises."""
+        now = time.time()
+        since = getattr(self, "_halt_unconfirmed_since", None)
+        if since is None:
+            since = self._halt_unconfirmed_since = now
+            self._halt_escalated = False
+        eq = getattr(self, "_last_known_equity", None)
+        for name in ("_maybe_finish_no_stop_close", "_maybe_reprotect"):
+            try:
+                getattr(self, name)(eq)
+            except Exception:
+                self.log.exception("HALT retry: %s failed", name)
+        if (now - since >= self.HALT_UNCONFIRMED_ESCALATE_S
+                and not getattr(self, "_halt_escalated", False)):
+            self._halt_escalated = True
+            mins = (now - since) / 60.0
+            self.log.critical("HALT: flat still NOT confirmed after %.0f min (%s)",
+                              mins, which)
+            try:
+                send_alert(f"URGENT {self.instance}: HALT cannot confirm flat for "
+                           f"{mins:.0f} min",
+                           f"{which}: the bot has been retrying the HALT close for "
+                           f"{mins:.0f} minutes and still cannot confirm the position "
+                           f"is flat. Stops are left resting; no entries. The process "
+                           f"stays up and keeps retrying. CHECK BINANCE NOW.")
+            except Exception:
+                self.log.exception("HALT escalation alert failed")
+
     def _exit_found_flat(self, why: str) -> None:
         """G3 (round 3): HALT / kill found the position ALREADY flat (strictly
         confirmed, nothing sent). The process is about to exit, so no later
@@ -4983,9 +5019,11 @@ class Bot:
                             # path with the same unknown position, in a loop.
                             self.log.error("HALT: flat NOT confirmed — not exiting; "
                                            "retrying the close")
+                            self._halt_retry_tick(which)   # G5
                             transient_backoff_s = min(transient_backoff_s * 2, 30)
                             time.sleep(transient_backoff_s)
                             continue
+                    self._halt_unconfirmed_since = None
                     state.enqueue_bot_event(
                         "halt",
                         payload={"dry_run": bool(self.dry_run),
