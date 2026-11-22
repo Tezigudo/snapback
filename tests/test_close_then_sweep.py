@@ -552,3 +552,33 @@ def test_raising_time_stop_close_also_rolls_back_the_same_bar_stamp():
          patch("bot.time.time", return_value=now):
         b._maybe_time_stop(equity=1000.0)            # the hook swallows the raise
     assert b._position_held_at == now
+
+
+
+def test_exit_found_flat_never_persists_zero_or_stale_equity():
+    """Round 4 check of G3: with equity unknown, the booked exit has NULL
+    equity_after (not 0.0), and the mail says 'unknown'."""
+    import sqlite3
+
+    from tests.test_orphan_bracket_cleanup import _flat
+    b, mc = _bot()
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    b._last_position_side, b._last_position_entry = "long", 65_000.0
+    b._last_position_qty, b._last_entry_root = 0.01, "r1"
+    b._last_known_equity = None
+    b._equity_stale = False
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.side_effect = None
+    mc.fetch_algo_orders.return_value = ([], True)
+    mc.ex.fetch_my_trades.return_value = [{"side": "sell", "price": 64_000.0}]
+    with patch("bot.send_alert") as alert, patch("bot.state.enqueue_bot_event") as ev:
+        b._exit_found_flat("HALT")
+    with sqlite3.connect(state.DB_PATH) as c:
+        row = c.execute("SELECT reason, equity_after FROM fills ORDER BY id DESC LIMIT 1").fetchone()
+    assert row == ("bracket_exit", None)
+    assert all(c.kwargs.get("equity_usd") is None for c in ev.call_args_list)
+    exit_mails = [c.args[1] for c in alert.call_args_list if "exit" in c.args[0].lower()]
+    assert exit_mails and "Equity now: $unknown" in exit_mails[0]

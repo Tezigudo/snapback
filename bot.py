@@ -3952,7 +3952,7 @@ class Bot:
                 f"by bracket (SL or TP)\n"
                 f"Entry: {entry_price:,.2f}  Exit: {exit_price:,.2f}\n"
                 f"PnL: ${pnl:+,.2f} ({pnl_pct:+.2f}%)\n"
-                f"Equity now: ${equity:,.2f}\n"
+                f"Equity now: ${_fmt_usd(equity)}\n"
                 f"signal_id: {signal_id or '(untagged)'}",
             )
         except Exception as e:
@@ -4944,8 +4944,14 @@ class Bot:
         was not recorded. NEVER raises."""
         try:
             if getattr(self, "_last_position_side", "unknown") not in ("flat", "unknown"):
+                # Equity is NOT read on a HALT / kill tick: mark it stale so the
+                # detector persists equity_after / equity_usd as NULL (never 0
+                # or a stale stand-in, which net-PnL differencing and the
+                # dashboard would read as real), and pass NaN, not 0.0, when
+                # nothing is known at all (round 4 check of G3).
+                self._equity_stale = True
                 eq = getattr(self, "_last_known_equity", None)
-                self._detect_bracket_exit(float(eq) if eq is not None else 0.0)
+                self._detect_bracket_exit(float(eq) if eq is not None else float("nan"))
         except Exception:
             self.log.exception("%s: exit detection before exit failed", why)
         n = None
