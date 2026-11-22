@@ -42,3 +42,46 @@ def test_confirmed_flat_still_enters():
     b = _bot()
     _enter(b, 271.0, _decision(3000.0))
     b._place_live_entry.assert_called_once()
+
+
+# --- G4 (round 3): escalate repeated unconfirmed-flat entry skips -------------
+
+def test_three_unconfirmed_skips_in_a_row_log_error_and_alert_once():
+    b = _bot()
+    b.client.fetch_position_checked.side_effect = PositionUnknown("stale")
+    alerts = []
+    for _ in range(5):
+        b._last_signal_ts = None                     # a new bar each time
+        alerts += [c.args[0] for c in _enter(b, 271.0, _decision(3000.0)).call_args_list]
+    blocked = [a for a in alerts if "entries blocked" in a]
+    assert len(blocked) == 1                         # rate-limited after the 3rd skip
+    assert b._entry_skip_unconfirmed_n == 5
+    b._place_live_entry.assert_not_called()
+
+
+def test_streak_resets_on_a_confirmed_flat():
+    b = _bot()
+    b.client.fetch_position_checked.side_effect = PositionUnknown("stale")
+    for _ in range(2):
+        b._last_signal_ts = None
+        _enter(b, 271.0, _decision(3000.0))
+    assert b._entry_skip_unconfirmed_n == 2
+    b.client.fetch_position_checked.side_effect = None
+    b.client.fetch_position_checked.return_value = __import__(
+        "tests.test_orphan_bracket_cleanup", fromlist=["_flat"])._flat()
+    b._last_signal_ts = None
+    _enter(b, 271.0, _decision(3000.0))
+    assert b._entry_skip_unconfirmed_n == 0
+
+
+def test_an_unconfirmed_skip_consumes_the_bar():
+    """G4: documented behaviour — the skipped signal is not retried on a later
+    tick of the same bar (the bar was consumed before evaluation)."""
+    b = _bot()
+    b.client.fetch_position_checked.side_effect = PositionUnknown("stale")
+    _enter(b, 271.0, _decision(3000.0))
+    b.client.fetch_position_checked.side_effect = None
+    b.client.fetch_position_checked.return_value = __import__(
+        "tests.test_orphan_bracket_cleanup", fromlist=["_flat"])._flat()
+    _enter(b, 271.0, _decision(3000.0))              # same bar: not re-evaluated
+    b._place_live_entry.assert_not_called()

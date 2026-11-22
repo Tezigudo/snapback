@@ -446,7 +446,8 @@ class Bot:
         # Consecutive ticks each call site has seen an UNCONFIRMED flat read
         # for a position it believed open (see _confirm_flat). One counter per
         # site, so three reads in one tick can never "confirm" each other.
-        self._flat_seen: dict[str, int] = {}
+        self._flat_seen: dict[str, tuple[int, int | None]] = {}   # site -> (n, tick)
+        self._tick_seq: int | None = None   # loop() tick index (F9)
         # Throttle bracket re-placement (see _maybe_reprotect) so a persistent
         # placement failure can't spam orders/alerts every poll.
         self._last_reprotect_ts: float = 0.0
@@ -468,6 +469,7 @@ class Bot:
         self._prev_tick_wallet: float | None = None
         self._transfer_suspect: dict | None = None
         self._kill_grace: dict | None = None   # _withdrawal_grace (2026-11)
+        self._bot_close_unconfirmed: dict | None = None   # F10
         # One alert per process when the per-position re-place cap is hit — the
         # cap itself is persisted in active_bracket; this only de-dupes the mail.
         self._reprotect_capped_alerted: bool = False
@@ -844,26 +846,46 @@ class Bot:
         except Exception:
             self.log.exception("boot: already-flat alert failed")
 
+    # Which params key each strategy's BACKTEST reads for its time stop. Live
+    # always time-stops on strategy.max_hold_bars (_maybe_time_stop).
+    _BACKTEST_TIME_STOP_KEY = {
+        "donchian-v3": "time_stop_bars",       # signals_donchian.DonchianBreakoutBTC
+        "multifactor-v1": "max_hold_bars",     # signals_multifactor.DayTradeMultiFactorBTC
+    }
+
     def _check_time_stop_parity(self) -> bool:
-        """Live time-stops on `strategy.max_hold_bars` (_maybe_time_stop); the
-        backtest on `strategy.time_stop_bars`. If both are set and differ, the
-        backtest is not modelling the live exit (2026-11 review: the donchian
-        harness ignored the live 48-bar time stop once). ERROR-level so the
-        monitor's ERROR alert mails it; does NOT refuse boot — this is a
-        research-parity defect, not a live-money hazard. Returns True on parity.
+        """Does this leg's backtest model its live time stop? (F12, per leg.)
+
+        Live time-stops on `strategy.max_hold_bars` (absent/None = 0 = off).
+        The backtest key differs per strategy (_BACKTEST_TIME_STOP_KEY): for
+        multifactor-v1 it IS max_hold_bars (parity by construction); for
+        donchian-v3 it is time_stop_bars. A backtest key that is unset while
+        live time-stops is a mismatch, not a skip. ERROR-level (the monitor's
+        ERROR alert mails it); does NOT refuse boot. A strategy with no known
+        backtest key is logged at INFO and passes. Returns True on parity.
         """
         s = (getattr(self, "params", None) or {}).get("strategy") or {}
-        ts, mh = s.get("time_stop_bars"), s.get("max_hold_bars")
-        if ts is None or mh is None:
+        strat = getattr(self, "strategy_name", None)
+        bt_key = self._BACKTEST_TIME_STOP_KEY.get(strat)
+        if bt_key is None:
+            self.log.info("params parity: no known backtest time-stop key for %s — "
+                          "not checked", strat)
             return True
-        try:
-            if int(ts) == int(mh):
-                return True
-        except (TypeError, ValueError):
-            pass
-        self.log.error("PARAMS PARITY: strategy.time_stop_bars=%r (backtest) != "
-                       "strategy.max_hold_bars=%r (live time stop) — the backtest "
-                       "does not model this leg's live exit", ts, mh)
+
+        def _bars(v):
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return "invalid"
+        live = _bars(s.get("max_hold_bars"))
+        live = 0 if live is None else live
+        bt = _bars(s.get(bt_key))
+        if bt == live:
+            return True
+        self.log.error("PARAMS PARITY (%s): backtest strategy.%s=%r != live "
+                       "strategy.max_hold_bars=%r — the backtest does not model "
+                       "this leg's live time stop", strat, bt_key,
+                       s.get(bt_key), s.get("max_hold_bars"))
         return False
 
     def stop(self, *_args) -> None:
@@ -1747,18 +1769,41 @@ class Bot:
         # would stack or flip the open position. Confirm flat strictly (with
         # the independent account endpoint behind an empty positionRisk)
         # before anything is cancelled or sent.
+        #
+        # A skip here CONSUMES the bar: _last_signal_ts was advanced and
+        # persisted above, before evaluation, so this signal is NOT retried on
+        # a later tick of the same bar (same as every other entry skip). The
+        # next bar is evaluated afresh.
         flat, seen = self._strict_flat_reads()
         if not flat:
+            n = getattr(self, "_entry_skip_unconfirmed_n", 0) + 1
+            self._entry_skip_unconfirmed_n = n
             self.log.warning("entry %s sid=%s SKIPPED: flat not confirmed by a "
-                             "strict read (%s) — nothing cancelled, nothing sent",
-                             decision.side, signal_id, seen)
+                             "strict read (%s) — nothing cancelled, nothing sent "
+                             "(%d in a row; bar consumed)",
+                             decision.side, signal_id, seen, n)
             try:
                 state.record_event("WARN", "entry_skipped_flat_unconfirmed",
-                                   {"side": decision.side, "seen": seen},
+                                   {"side": decision.side, "seen": seen, "streak": n},
                                    signal_id=signal_id)
             except Exception:
                 self.log.exception("entry-skip bookkeeping failed")
+            if n >= self.ENTRY_SKIP_ESCALATE_AFTER:
+                # G4: a leg that keeps refusing entries on an unconfirmable
+                # flat is not trading. ERROR (the monitor mails it) plus our
+                # own alert, at most once per ENTRY_SKIP_ALERT_S.
+                self.log.error("entry blocked: %d signals in a row skipped because "
+                               "flat could not be confirmed (%s)", n, seen)
+                now = time.time()
+                if now - getattr(self, "_entry_skip_alert_ts", 0.0) >= self.ENTRY_SKIP_ALERT_S:
+                    self._entry_skip_alert_ts = now
+                    send_alert(f"{self.instance}: entries blocked — flat unconfirmable",
+                               f"{n} entry signals in a row were skipped because a "
+                               f"strict position read could not confirm the leg is "
+                               f"flat (last: {seen}). Each skip consumes its bar. "
+                               f"Check Binance and the position endpoints.")
             return
+        self._entry_skip_unconfirmed_n = 0
         try:
             self._place_live_entry(decision, qty, signal_id, equity)
         except Exception as e:
@@ -2540,13 +2585,43 @@ class Bot:
             self.log.warning("unverified entry: position read failed: %s", e)
             return
         if pos.side == "flat" or not pos.qty:
-            if now - float(u.get("since") or 0) >= self.UNVERIFIED_SETTLE_S \
-                    and self.client.cancel_entry_order(self.symbol, root) is True:
-                self._clear_unverified()
-                self.log.warning("unverified entry %s: confirmed gone, nothing filled", root)
-                send_alert("Entry error resolved — nothing filled",
-                           f"The entry order {root} is confirmed gone and no position "
-                           f"opened. Entries resume.")
+            if now - float(u.get("since") or 0) < self.UNVERIFIED_SETTLE_S:
+                return
+            # G1 (2026-11 round 3): the lenient read above is ONE read, and
+            # cancel_entry_order() is True also when the order already FILLED.
+            # Clear only on a STRICT flat (account-endpoint backed), and say
+            # "nothing filled" only when the order's own filled qty proves it.
+            # The settle window is this site's debounce (it polls every
+            # UNVERIFIED_POLL_S, not every tick, so the tick debounce cannot
+            # apply).
+            flat_ok, seen = self._strict_flat_reads()
+            if not flat_ok:
+                self.log.warning("unverified entry %s: lenient flat NOT confirmed "
+                                 "(%s) — record kept, entries stay blocked", root, seen)
+                return
+            if self.client.cancel_entry_order(self.symbol, root) is not True:
+                return
+            filled = self.client.entry_order_filled(self.symbol, root)
+            tol = max(float(self.constraints.qty_step or 0.0) / 2, 1e-12)
+            if filled is None:
+                self.log.warning("unverified entry %s: flat confirmed but the order's "
+                                 "filled qty is unreadable — record kept", root)
+                return
+            self._clear_unverified()
+            if filled > tol:
+                self.log.error("unverified entry %s: it FILLED %.6f but the position "
+                               "is now confirmed flat — closed outside the ledger",
+                               root, filled)
+                send_alert("Entry error — the entry FILLED, position now flat",
+                           f"Entry {root} filled {filled:.6f} {self.base_asset}, but the "
+                           f"position is now confirmed flat (stop, TP, liquidation or a "
+                           f"manual close). The ledger may be missing this trade; "
+                           f"reconcile it from Binance. Entries resume.")
+                return
+            self.log.warning("unverified entry %s: confirmed gone, nothing filled", root)
+            send_alert("Entry error resolved — nothing filled",
+                       f"The entry order {root} is confirmed gone, it filled nothing, and "
+                       f"the position is confirmed flat. Entries resume.")
             return
         if u.get("retry_protect") and pos.side == u.get("side"):
             if self._protect_or_close_open(
@@ -3303,6 +3378,8 @@ class Bot:
     BRACKET_SITE = "bracket_exit"
 
     TP_PLACED_KEY = "tp_placed_root"
+    ENTRY_SKIP_ESCALATE_AFTER = 3     # G4: consecutive F1 skips before ERROR + alert
+    ENTRY_SKIP_ALERT_S = 3600.0
 
     def _tp_was_placed(self) -> bool:
         """Was a TP recorded as placed for the position being tracked? Fails
@@ -3325,7 +3402,7 @@ class Bot:
             self.log.exception("tp-placed bookkeeping failed")
 
     def _flat_pending(self, site: str) -> bool:
-        return self._flat_seen.get(site, 0) > 0
+        return site in self._flat_seen
 
     def _flat_clear(self, site: str) -> None:
         self._flat_seen.pop(site, None)
@@ -3354,8 +3431,21 @@ class Bot:
         bracket site) per flat-edge tick only — never on a healthy open or a
         healthy flat tick.
         """
-        n = self._flat_seen.get(site, 0) + 1
-        self._flat_seen[site] = n
+        # F9: STRICTLY consecutive loop ticks. A tick on which this site did
+        # not run (equity unknown → the detector is skipped) breaks the
+        # streak; a second call within the same tick does not extend it.
+        # Outside loop() (no tick index) every call counts as a new tick.
+        seq = getattr(self, "_tick_seq", None)
+        prev_n, prev_seq = self._flat_seen.get(site, (0, None))
+        if seq is None or prev_seq is None:
+            n = prev_n + 1
+        elif prev_seq == seq:
+            n = prev_n
+        elif prev_seq == seq - 1:
+            n = prev_n + 1
+        else:
+            n = 1
+        self._flat_seen[site] = (n, seq)
         try:
             second = self.client.fetch_position_checked(self.symbol)
         except Exception as e:
@@ -3394,14 +3484,27 @@ class Bot:
             if stop_evidence:
                 msg = ("bracket still intact" if intact
                        else "algo book unreadable")
-                self.log.warning("%s: flat accepted after %d consecutive flat "
-                                 "ticks with no fill evidence (%s) — closed "
-                                 "outside the bot?", site, n, msg)
-                send_alert(f"{self.instance}: position flat, {msg}",
-                           f"{site}: {n} consecutive flat position reads, but "
-                           f"no evidence the SL or TP filled ({msg}). Treating the "
-                           f"position as closed (manual close or liquidation?) "
-                           f"and sweeping the leg's orders. Check Binance.")
+                bc = getattr(self, "_bot_close_unconfirmed", None)
+                self._bot_close_unconfirmed = None
+                if bc:
+                    # F10: the bot's own close, sent earlier but unconfirmed then.
+                    self.log.warning("%s: flat confirmed after the bot's %s close "
+                                     "(sent, unconfirmed at the time; %s)",
+                                     site, bc["why"], msg)
+                    send_alert(f"{self.instance}: bot {bc['why']} close now confirmed flat",
+                               f"{site}: the bot's {bc['why']} close was sent but "
+                               f"flat could not be confirmed at the time. {n} "
+                               f"consecutive flat reads now confirm it; sweeping the "
+                               f"leg's remaining orders ({msg}).")
+                else:
+                    self.log.warning("%s: flat accepted after %d consecutive flat "
+                                     "ticks with no fill evidence (%s) — closed "
+                                     "outside the bot?", site, n, msg)
+                    send_alert(f"{self.instance}: position flat, {msg}",
+                               f"{site}: {n} consecutive flat position reads, but "
+                               f"no evidence the SL or TP filled ({msg}). Treating the "
+                               f"position as closed (manual close or liquidation?) "
+                               f"and sweeping the leg's orders. Check Binance.")
             return True
         self.log.warning("%s: flat read awaiting confirmation (%d/%d)%s — "
                          "nothing cancelled or cleared this tick", site, n,
@@ -4585,7 +4688,9 @@ class Bot:
             return
         if not any(r.get("clientAlgoId") == sb_coid for r in rows):
             if self._breakeven_through(pos.side, be_price):
-                self._breakeven_close(pos, root, be_price, mfe, equity)
+                if not self._breakeven_close(pos, root, be_price, mfe, equity):
+                    self._breakeven_failed("breakeven close not confirmed flat", now)
+                    return
                 ab["be_moved"] = True
                 state.set_meta("active_bracket", json.dumps(ab))
                 self._be_evaluated_bar = last_closed
@@ -4600,7 +4705,9 @@ class Bot:
                 # not by matching an error string the algo endpoint may word
                 # differently.
                 if self._breakeven_through(pos.side, be_price):
-                    self._breakeven_close(pos, root, be_price, mfe, equity)
+                    if not self._breakeven_close(pos, root, be_price, mfe, equity):
+                        self._breakeven_failed("breakeven close not confirmed flat", now)
+                        return
                     ab["be_moved"] = True
                     state.set_meta("active_bracket", json.dumps(ab))
                     self._be_evaluated_bar = last_closed
@@ -4702,12 +4809,17 @@ class Bot:
                                          f"Nothing was cancelled. Check Binance.")
             return None, flat
         if not flat:
+            # F10: remember it, so the flat edge that later confirms this
+            # position closed says "bot close", not "manual close?".
+            self._bot_close_unconfirmed = {"why": why, "leg": close_leg,
+                                           "ts": time.time()}
             self._alert_close_failed(close_leg, why,
                                      f"the close order was sent but the "
                                      f"position is NOT confirmed flat ({last}). "
                                      f"The stop and TP were NOT cancelled. "
                                      f"Check Binance.")
             return order, False
+        self._bot_close_unconfirmed = None
         try:
             self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
         except Exception:
@@ -4715,6 +4827,75 @@ class Bot:
             # _detect_bracket_exit / boot / the pre-entry sweep remove them.
             self.log.exception("%s close: post-close sweep failed", why)
         return order, True
+
+    HALT_UNCONFIRMED_ESCALATE_S = 600.0   # G5: louder alert after this long
+
+    def _halt_retry_tick(self, which: str) -> None:
+        """G5 (round 3): one HALT retry iteration with flat still unconfirmed.
+        Runs the risk-REDUCING hooks only — the pending no-stop close and
+        reprotect (re-places a missing stop where enabled). No entries, no
+        breakeven (it moves stops), no trend/time exits (the HALT close is
+        already the exit). Escalates ONCE after HALT_UNCONFIRMED_ESCALATE_S.
+        NEVER raises."""
+        now = time.time()
+        since = getattr(self, "_halt_unconfirmed_since", None)
+        if since is None:
+            since = self._halt_unconfirmed_since = now
+            self._halt_escalated = False
+        eq = getattr(self, "_last_known_equity", None)
+        for name in ("_maybe_finish_no_stop_close", "_maybe_reprotect"):
+            try:
+                getattr(self, name)(eq)
+            except Exception:
+                self.log.exception("HALT retry: %s failed", name)
+        if (now - since >= self.HALT_UNCONFIRMED_ESCALATE_S
+                and not getattr(self, "_halt_escalated", False)):
+            self._halt_escalated = True
+            mins = (now - since) / 60.0
+            self.log.critical("HALT: flat still NOT confirmed after %.0f min (%s)",
+                              mins, which)
+            try:
+                send_alert(f"URGENT {self.instance}: HALT cannot confirm flat for "
+                           f"{mins:.0f} min",
+                           f"{which}: the bot has been retrying the HALT close for "
+                           f"{mins:.0f} minutes and still cannot confirm the position "
+                           f"is flat. Stops are left resting; no entries. The process "
+                           f"stays up and keeps retrying. CHECK BINANCE NOW.")
+            except Exception:
+                self.log.exception("HALT escalation alert failed")
+
+    def _exit_found_flat(self, why: str) -> None:
+        """G3 (round 3): HALT / kill found the position ALREADY flat (strictly
+        confirmed, nothing sent). The process is about to exit, so no later
+        flat edge will run: book the exit now if the detector can, sweep the
+        leg's resting orders (safe — flat is confirmed), and mail what was and
+        was not recorded. NEVER raises."""
+        try:
+            if getattr(self, "_last_position_side", "unknown") not in ("flat", "unknown"):
+                eq = getattr(self, "_last_known_equity", None)
+                self._detect_bracket_exit(float(eq) if eq is not None else 0.0)
+        except Exception:
+            self.log.exception("%s: exit detection before exit failed", why)
+        n = None
+        try:
+            n = self.client.cancel_open_orders(self.symbol, coid_prefix=self.coid_prefix)
+        except Exception:
+            self.log.exception("%s: pre-exit sweep failed", why)
+        try:
+            unbooked = self._open_entry_fill() is not None
+        except Exception:
+            unbooked = None
+        msg = (f"{why}: the position was already flat (confirmed) when the bot went "
+               f"to close it. Leg orders swept: {n if n is not None else 'FAILED'}. "
+               + ("The exit is NOT in the ledger (newest fill is still the entry): "
+                  "reconcile it from Binance." if unbooked else
+                  "The exit is recorded." if unbooked is False else
+                  "Ledger state unreadable: check the exit."))
+        self.log.warning("%s", msg)
+        try:
+            send_alert(f"{self.instance}: {why} found the position already flat", msg)
+        except Exception:
+            self.log.exception("%s: found-flat alert failed", why)
 
     def _strict_flat_reads(self) -> tuple[bool, str]:
         """(confirmed_flat, last_observation) from up to CLOSE_CONFIRM_READS
@@ -4748,7 +4929,7 @@ class Bot:
             self.log.exception("close-failed alert could not be sent")
 
     def _breakeven_close(self, pos, root: str, be_price: float, mfe: float,
-                         equity: float) -> None:
+                         equity: float) -> bool:
         """Price is already back through breakeven: close at market — the
         backtest fills this case at the next bar's open. Mirrors
         _maybe_channel_exit's close + ledger path.
@@ -4767,7 +4948,15 @@ class Bot:
         # stop and no TP, and a retry that finds price back above breakeven
         # would restore only the -sb stop — the TP lost for good.)
         self._note_held(time.time())
-        order, _flat = self._close_then_sweep(root, "be", "breakeven")
+        order, flat = self._close_then_sweep(root, "be", "breakeven")
+        if not flat:
+            # G2 (round 3): close sent (or skipped) but flat NOT confirmed —
+            # book nothing (no breakeven_exit row, no "Closed" mail) and tell
+            # the caller NOT to set be_moved, so the step is retried. The
+            # close-failed alert already went out; the stops are still resting.
+            self.log.warning("Breakeven: close NOT confirmed flat — nothing "
+                             "recorded, breakeven not marked done")
+            return False
         if order is None:
             # Already flat by the time close_position looked (e.g. a manual
             # close in between). Write NOTHING: a bogus `close` row here would
@@ -4775,7 +4964,7 @@ class Bot:
             # and suppress its true price/PnL. It records the exit next tick.
             self.log.warning("Breakeven: position already flat at close time — "
                              "leaving the exit to _detect_bracket_exit")
-            return
+            return True
         exit_price = self._resolve_fill_price(order)
         _entry = self._open_entry_fill()
         state.record_fill(side="close", qty=pos.qty, price=float(exit_price or 0.0),
@@ -4793,12 +4982,14 @@ class Bot:
                    f"{be_price:,.4f}"
                    + (f" @ {exit_price:,.4f}" if exit_price else "")
                    + f". Equity: {equity:.2f}\nsignal_id: {root}")
+        return True
 
     def loop(self) -> int:
         self.log.info("Bot loop started. poll=%.1fs symbol=%s", self.poll_s, self.symbol)
         backoff_s = self.poll_s
         transient_backoff_s = self.poll_s
         while not self._stopped:
+            self._tick_seq = (getattr(self, "_tick_seq", None) or 0) + 1
             try:
                 self._heartbeat()
                 halt_by = halt_source(self.instance)
@@ -4813,6 +5004,8 @@ class Bot:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries next tick
                         _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
+                        if halt_flat and _o is None:
+                            self._exit_found_flat("HALT")   # G3
                         if not halt_flat:
                             # F5: do NOT exit while flat is unconfirmed. The
                             # units restart only on-failure, so `return 0` here
@@ -4826,9 +5019,11 @@ class Bot:
                             # path with the same unknown position, in a loop.
                             self.log.error("HALT: flat NOT confirmed — not exiting; "
                                            "retrying the close")
+                            self._halt_retry_tick(which)   # G5
                             transient_backoff_s = min(transient_backoff_s * 2, 30)
                             time.sleep(transient_backoff_s)
                             continue
+                    self._halt_unconfirmed_since = None
                     state.enqueue_bot_event(
                         "halt",
                         payload={"dry_run": bool(self.dry_run),
@@ -4881,6 +5076,8 @@ class Bot:
                         # raises → stops kept, alert sent, loop retries (the
                         # kill switch wrote HALT, so the HALT path re-closes)
                         _o, kill_flat = self._close_then_sweep(root, "k", "kill-switch")
+                        if kill_flat and _o is None:
+                            self._exit_found_flat("kill-switch")   # G3
                         if not kill_flat:
                             # F5: same as HALT — stay alive; HALT_<leg> now
                             # exists, so the next tick's HALT branch retries

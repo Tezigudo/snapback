@@ -283,3 +283,55 @@ def test_checked_read_open():
     p = _client([{"symbol": "BTC/USDT:USDT", "contracts": 0.01, "side": "long",
                   "entryPrice": 65000.0}]).fetch_position_checked("BTC/USDT:USDT")
     assert (p.side, p.qty) == ("long", 0.01)
+
+
+# --- F9: the debounce counts STRICTLY consecutive loop ticks ------------------
+
+def test_debounce_resets_across_a_skipped_tick():
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    b._tick_seq = 10
+    _tick(b)                                  # 1/2 at tick 10
+    b._tick_seq = 12                          # tick 11: detector skipped (equity None)
+    _tick(b)                                  # streak broken: 1/2 again, NOT accepted
+    _assert_untouched(b, mc)
+    b._tick_seq = 13
+    _tick(b)                                  # 2/2 on consecutive ticks: accepted
+    mc.cancel_open_orders.assert_called_once()
+
+
+def test_two_calls_in_one_tick_do_not_confirm():
+    b, mc = _bot()
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    b._tick_seq = 5
+    _tick(b)
+    _tick(b)                                  # same tick: still 1/2
+    _assert_untouched(b, mc)
+
+
+# --- F10: a bot close confirmed late is not called "manual close?" -----------
+
+def test_late_confirmation_of_a_bot_close_says_bot_close():
+    b, mc = _bot()
+    b._bot_close_unconfirmed = {"why": "time-stop", "leg": "x", "ts": 0.0}
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)   # sweep never ran
+    _tick(b)
+    alert = _tick(b)
+    subjects = [c.args[0] for c in alert.call_args_list]
+    assert any("bot time-stop close now confirmed flat" in s for s in subjects), subjects
+    assert not any("position flat, bracket" in s for s in subjects)
+    assert b._bot_close_unconfirmed is None
+
+
+def test_without_a_bot_close_it_still_asks_manual_close():
+    b, mc = _bot()
+    b._bot_close_unconfirmed = None
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL, TP], True)
+    _tick(b)
+    alert = _tick(b)
+    body = " ".join(c.args[1] for c in alert.call_args_list)
+    assert "manual close or liquidation?" in body

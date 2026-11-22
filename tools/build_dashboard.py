@@ -270,7 +270,7 @@ def render_html(db: dict, logs: list[dict], instance: str = "v1") -> str:
     interesting = [e for e in logs if "heartbeat" not in (e.get("msg", "").lower())]
     recent_events = list(reversed(interesting[-20:]))
 
-    errors = [e for e in logs if e.get("level") in ("ERROR", "WARNING")]
+    errors = [e for e in logs if e.get("level") in ("CRITICAL", "ERROR", "WARNING")]
     recent_errors = list(reversed(errors[-10:]))
 
     fills_html_rows = []
@@ -290,7 +290,7 @@ def render_html(db: dict, logs: list[dict], instance: str = "v1") -> str:
     events_html_rows = []
     for ev in recent_events:
         lvl = ev.get("level", "INFO")
-        cls = {"ERROR": "row-err", "WARNING": "row-warn"}.get(lvl, "")
+        cls = {"CRITICAL": "row-err", "ERROR": "row-err", "WARNING": "row-warn"}.get(lvl, "")
         events_html_rows.append(
             f"<tr class='{cls}'><td>{to_local(ev.get('ts',''))}</td>"
             f"<td>{html.escape(lvl)}</td>"
@@ -304,7 +304,7 @@ def render_html(db: dict, logs: list[dict], instance: str = "v1") -> str:
     err_html_rows = []
     for ev in recent_errors:
         lvl = ev.get("level", "INFO")
-        cls = {"ERROR": "row-err", "WARNING": "row-warn"}.get(lvl, "")
+        cls = {"CRITICAL": "row-err", "ERROR": "row-err", "WARNING": "row-warn"}.get(lvl, "")
         err_html_rows.append(
             f"<tr class='{cls}'><td>{to_local(ev.get('ts',''))}</td>"
             f"<td>{html.escape(lvl)}</td>"
