@@ -694,11 +694,14 @@ class Bot:
                                  "Flattening (root=%s).",
                                  pos.side, pos.qty, pos.entry_price, root or "—")
                 close_order, bf_flat = self._close_then_sweep(root, "bf", "boot-flatten")
+                if not bf_flat:
+                    # Flat NOT confirmed (F3): nothing swept, no boot_flatten
+                    # event / PnL / "flattened" mail — _close_then_sweep already
+                    # sent the close-failed alert. The no-stop records are KEPT
+                    # (the position may be open); the tick loop owns it.
+                    return
                 if close_order is None:
-                    if bf_flat:
-                        self._boot_close_found_flat(pos, root)
-                    # else: not confirmed flat — nothing swept, already alerted
-                    # by _close_then_sweep; the tick loop owns the position.
+                    self._boot_close_found_flat(pos, root)   # clears the records itself
                     return
                 # Emit the REAL flatten fill + post-close equity so the dashboard
                 # attributes the actual PnL. Previously this sent the ENTRY price
@@ -740,6 +743,23 @@ class Bot:
             # orders left over from a prior run (e.g. a surviving bracket sibling
             # after an exchange-driven TP/SL fill).  Only our own COID prefix.
             if not self.dry_run:
+                # F3: ONE lenient read said flat. donchian / SOL have no
+                # reprotect, so sweeping a live position's SL here would leave
+                # it naked. Sweep only on a strictly confirmed flat.
+                flat_ok, seen = self._strict_flat_reads()
+                if not flat_ok:
+                    self.log.error("boot: position read flat but NOT confirmed by "
+                                   "a strict read (%s) — leg orders left alone, "
+                                   "no-stop records kept", seen)
+                    try:
+                        send_alert(f"{self.instance}: boot could not confirm flat",
+                                   f"boot() read {self.symbol} as flat, but a strict "
+                                   f"re-read does not confirm it ({seen}). Nothing "
+                                   f"was cancelled. The tick loop will track the "
+                                   f"position. Check Binance.")
+                    except Exception:
+                        self.log.exception("boot: unconfirmed-flat alert failed")
+                    return
                 try:
                     n = self.client.cancel_open_orders(
                         self.symbol, coid_prefix=self.coid_prefix)
