@@ -4776,11 +4776,26 @@ class Bot:
                     self.log.warning("HALT flag present [%s] — %s.", which,
                                      "exiting (DRY-RUN, no flatten)" if self.dry_run
                                      else "flattening and exiting")
-                    halt_flat = True
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries next tick
                         _o, halt_flat = self._close_then_sweep(root, "h", "HALT")
+                        if not halt_flat:
+                            # F5: do NOT exit while flat is unconfirmed. The
+                            # units restart only on-failure, so `return 0` here
+                            # left the leg down holding an open position. Stay
+                            # alive: stops stay resting (nothing was swept), no
+                            # entry can run (this branch precedes everything
+                            # else in the tick), and the close is retried every
+                            # tick on a capped backoff; the close-failed alert
+                            # is rate-limited. Preferred over exiting non-zero,
+                            # which would restart into boot() and its flatten
+                            # path with the same unknown position, in a loop.
+                            self.log.error("HALT: flat NOT confirmed — not exiting; "
+                                           "retrying the close")
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
                     state.enqueue_bot_event(
                         "halt",
                         payload={"dry_run": bool(self.dry_run),
@@ -4792,7 +4807,7 @@ class Bot:
                         self.log.warning("halt push failed: %s", e)
                     send_alert("Bot HALTED",
                                f"{which} detected. "
-                               f"{'DRY-RUN exit, no flatten.' if self.dry_run else ('Position flattened.' if halt_flat else 'Close sent but flat NOT confirmed — stops left resting, CHECK BINANCE.')} "
+                               f"{'DRY-RUN exit, no flatten.' if self.dry_run else 'Position flattened (confirmed flat).'} "
                                f"Bot exiting.")
                     return 0
 
@@ -4832,7 +4847,16 @@ class Bot:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries (the
                         # kill switch wrote HALT, so the HALT path re-closes)
-                        self._close_then_sweep(root, "k", "kill-switch")
+                        _o, kill_flat = self._close_then_sweep(root, "k", "kill-switch")
+                        if not kill_flat:
+                            # F5: same as HALT — stay alive; HALT_<leg> now
+                            # exists, so the next tick's HALT branch retries
+                            # the close and exits only on a confirmed flat.
+                            self.log.error("kill switch: flat NOT confirmed — not "
+                                           "exiting; the HALT path retries the close")
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
                     return 0
 
                 # #49 no-stop hooks are risk-REDUCING (close / protect a naked
