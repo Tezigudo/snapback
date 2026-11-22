@@ -1721,6 +1721,24 @@ class Bot:
             self.log.warning("entry %s sid=%s skipped: entries paused",
                              decision.side, signal_id)
             return
+        # F1 (2026-11 fix-pass): the gate above is ONE lenient read. A false
+        # flat there would reach _place_live_entry, whose pre-entry sweep
+        # cancels the leg's live SL/TP, and a second NON-reduce-only entry
+        # would stack or flip the open position. Confirm flat strictly (with
+        # the independent account endpoint behind an empty positionRisk)
+        # before anything is cancelled or sent.
+        flat, seen = self._strict_flat_reads()
+        if not flat:
+            self.log.warning("entry %s sid=%s SKIPPED: flat not confirmed by a "
+                             "strict read (%s) — nothing cancelled, nothing sent",
+                             decision.side, signal_id, seen)
+            try:
+                state.record_event("WARN", "entry_skipped_flat_unconfirmed",
+                                   {"side": decision.side, "seen": seen},
+                                   signal_id=signal_id)
+            except Exception:
+                self.log.exception("entry-skip bookkeeping failed")
+            return
         try:
             self._place_live_entry(decision, qty, signal_id, equity)
         except Exception as e:
