@@ -538,3 +538,17 @@ def test_halt_retry_marks_equity_stale_so_nothing_persists_it():
     with patch("bot.send_alert"):
         b._halt_retry_tick("self data/HALT_v1")
     assert seen == [None]
+
+
+def test_raising_time_stop_close_also_rolls_back_the_same_bar_stamp():
+    """H4 (round 4): the G11 rollback must run when _close_then_sweep raises."""
+    from bot_internals import _TIME_STOP_REENTERS_SAME_BAR
+    strat = sorted(_TIME_STOP_REENTERS_SAME_BAR)[0]
+    b, mc = _same_bar_time_stop_bot(strat)
+    b._position_held_at = None
+    mc.close_position.side_effect = RuntimeError("timeout")
+    now = 1_800_000_000.0 + 1800
+    with patch("bot.send_alert"), patch("bot.time_stop_due", return_value=True), \
+         patch("bot.time.time", return_value=now):
+        b._maybe_time_stop(equity=1000.0)            # the hook swallows the raise
+    assert b._position_held_at == now

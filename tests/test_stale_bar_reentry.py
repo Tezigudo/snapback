@@ -210,14 +210,19 @@ def test_time_stop_follows_each_legs_backtest(strategy, consumed) -> None:
     b._position_held_at = _epoch("2026-10-22 02:30:01")    # this tick's detector stamp
     state.record_fill(side="long", qty=0.01, price=65000.0, reason="entry")
     mc.fetch_position.return_value = _open("long")
-    seen = _stamp_at_close(b, mc)
+    seen: list = []
+
+    def _close(*a, **k):
+        # stamped BEFORE closing; the close then really flattens (H4: the
+        # same-bar stamp only survives a CONFIRMED time-stop close)
+        seen.append(b._position_held_at)
+        mc.fetch_position.return_value = _flat()
+        return {"id": "1", "average": 65000.0}
+    mc.close_position.side_effect = _close
     with patch("bot.time_stop_due", return_value=True), \
             patch("bot.time.time", return_value=_epoch("2026-10-22 02:30:02")), \
             patch("bot.send_alert"):
-        try:
-            b._maybe_time_stop(equity=140.0)
-        except RuntimeError:
-            pass
+        b._maybe_time_stop(equity=140.0)
     assert len(seen) == 1                                    # stamped BEFORE closing
     b._consume_held_bars()
     assert b._last_signal_ts == T(consumed)
