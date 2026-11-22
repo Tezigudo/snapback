@@ -29,6 +29,15 @@ from strategy.indicators import atr, ema
 from strategy.signals import require_params
 
 
+def _same_bar_spacing(a: pd.Index, b: pd.Index) -> bool:
+    """True when both frames have the same (median) bar spacing."""
+    if len(a) < 2 or len(b) < 2:
+        return False
+    da = pd.Series(a).diff().median()
+    db = pd.Series(b).diff().median()
+    return bool(da == db)
+
+
 def attach_donchian(
     df_15m: pd.DataFrame,
     klines_1h: pd.DataFrame,
@@ -55,7 +64,20 @@ def attach_donchian(
     lower = one_h["Close"].rolling(period_entry, min_periods=period_entry).min().shift(1)
     exit_u = one_h["Close"].rolling(period_exit, min_periods=period_exit).max().shift(1)
     exit_l = one_h["Close"].rolling(period_exit, min_periods=period_exit).min().shift(1)
-    atr_v = atr(one_h["High"], one_h["Low"], one_h["Close"], atr_period).shift(1)
+    # ATR convention = LIVE's (2026-11 review). live_donchian_v3 sizes the stop
+    # with the SIGNAL bar's own ATR (`atr(...).iloc[-1]` on closed bars), and
+    # the backtest acts at that same bar's close, so on a same-timeframe frame
+    # the unshifted ATR has no lookahead. The old `.shift(1)` used the bar
+    # BEFORE the breakout — narrower on breakout bars, so tighter stops and
+    # bigger sizes than live: it overstated the donchian baseline (+1350% vs
+    # +906% in the review's own sim). The channels keep their shift(1): live
+    # shifts them too. A HIGHER-timeframe indicator frame (the legacy
+    # 15m-on-1h use) still needs the shift, or each 1h value would be
+    # forward-filled into 15m rows before that 1h bar closed.
+    same_tf = _same_bar_spacing(df_15m.index, one_h.index)
+    atr_v = atr(one_h["High"], one_h["Low"], one_h["Close"], atr_period)
+    if not same_tf:
+        atr_v = atr_v.shift(1)
 
     out = df_15m.copy()
     out["DonchianUpper"] = upper.reindex(out.index, method="ffill")

@@ -272,7 +272,8 @@ _FLATTEN_SHA256_WITH_ALREADY_FLAT = (
 # back the pinned pre-2026-11 block, so any OTHER change still fails here.
 #   - close FIRST, sweep AFTER (_close_then_sweep; was close_position's
 #     sweep-then-close default);
-#   - the already-flat branch sweeps only on a CONFIRMED flat.
+#   - the already-flat branch sweeps only on a CONFIRMED flat;
+#   - every boot flatten mails (_alert_boot_flatten).
 _2026_11_EDITS = (
     ('                close_order, bf_flat = self._close_then_sweep(root, "bf", "boot-flatten")\n',
      '                close_order = self.client.close_position(\n'
@@ -284,6 +285,10 @@ _2026_11_EDITS = (
      '                    # by _close_then_sweep; the tick loop owns the position.\n'
      '                    return\n',
      _ALREADY_FLAT_INSERT),
+    # boot-flatten alert (item 5): an insertion, reverted to nothing
+    ('                self._alert_boot_flatten(pos, root, close_price, pnl_usd,\n'
+     '                                         verdict[1], bf_flat)\n',
+     ''),
 )
 
 

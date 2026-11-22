@@ -111,6 +111,7 @@ from exchange.env import (
 from risk import (
     RiskBreach,
     check_daily_loss,
+    clamp_qty_to_notional_cap,
     check_leverage,
     check_notional,
     check_symbol,
@@ -466,6 +467,7 @@ class Bot:
         self._prev_tick_fingerprint: tuple | None = None
         self._prev_tick_wallet: float | None = None
         self._transfer_suspect: dict | None = None
+        self._kill_grace: dict | None = None   # _withdrawal_grace (2026-11)
         # One alert per process when the per-position re-place cap is hit — the
         # cap itself is persisted in active_bracket; this only de-dupes the mail.
         self._reprotect_capped_alerted: bool = False
@@ -510,6 +512,7 @@ class Bot:
     def boot(self) -> None:
         check_symbol(self.symbol)
         check_leverage(self.leverage)
+        self._check_time_stop_parity()
 
         # Load live exchange constraints (min qty, min notional). Tighter
         # of hard-coded fallbacks vs live values wins.
@@ -644,7 +647,7 @@ class Bot:
                 self.log.warning("Boot found open position %s qty=%.4f @ %.2f. "
                                  "DRY-RUN: leaving it alone.",
                                  pos.side, pos.qty, pos.entry_price)
-            elif self._boot_resume_verdict(pos)[0]:
+            elif (verdict := self._boot_resume_verdict(pos))[0]:
                 # RESUME. The tick loop owns this position from here exactly as
                 # if no restart had happened: its age still reads from the fills
                 # table, the daily anchor still reads from state.meta, and the
@@ -713,6 +716,8 @@ class Bot:
                     equity_after = None
                 pnl_usd = _exit_pnl_usd(pos.side, pos.entry_price,
                                         close_price, pos.qty)
+                self._alert_boot_flatten(pos, root, close_price, pnl_usd,
+                                         verdict[1], bf_flat)
                 state.record_event("WARN", "boot_flatten",
                                    {"side": pos.side, "qty": pos.qty,
                                     "entry": pos.entry_price, "exit": close_price,
@@ -744,6 +749,30 @@ class Bot:
                 except Exception:
                     self.log.exception("boot: cancel_open_orders failed")
         self._clear_no_stop_records_at_boot()
+
+    def _alert_boot_flatten(self, pos, root: str | None, close_price: float | None,
+                            pnl_usd: float | None, reason: str, flat: bool) -> None:
+        """Mail every boot flatten (2026-11 review, N7): a restart closing a
+        live trade used to leave only a log line and a WARN event. Own try,
+        BEFORE the bookkeeping, so a sqlite failure cannot swallow it. NEVER
+        raises. Boot-resume is NOT armed by this; `reason` is its refusal."""
+        try:
+            send_alert(
+                f"{self.instance}: BOOT FLATTENED {pos.side.upper()} {pos.qty:.4f} "
+                f"{self.base_asset}",
+                f"Leg: {self.instance} ({self.symbol})\n"
+                f"Side: {pos.side}  Size: {pos.qty:.6f} {self.base_asset}\n"
+                f"Entry: {pos.entry_price:,.4f}  Close: "
+                f"{(close_price or 0.0):,.4f}  PnL: "
+                + (f"${pnl_usd:+,.2f}" if pnl_usd is not None else "unknown")
+                + f"\nReason: restart found an open position; not resumed "
+                f"({reason}).\n"
+                + ("Flat confirmed; leg orders swept." if flat else
+                   "Close sent but flat NOT confirmed — stops left resting. "
+                   "CHECK BINANCE.")
+                + f"\nsignal_id: {root or '(untagged)'}")
+        except Exception:
+            self.log.exception("boot-flatten alert failed")
 
     def _boot_close_found_flat(self, pos, root: str | None) -> None:
         """The boot flatten found the exchange ALREADY flat. NEVER raises.
@@ -794,6 +823,28 @@ class Bot:
                        f"{self.instance} leg: {msg}")
         except Exception:
             self.log.exception("boot: already-flat alert failed")
+
+    def _check_time_stop_parity(self) -> bool:
+        """Live time-stops on `strategy.max_hold_bars` (_maybe_time_stop); the
+        backtest on `strategy.time_stop_bars`. If both are set and differ, the
+        backtest is not modelling the live exit (2026-11 review: the donchian
+        harness ignored the live 48-bar time stop once). ERROR-level so the
+        monitor's ERROR alert mails it; does NOT refuse boot — this is a
+        research-parity defect, not a live-money hazard. Returns True on parity.
+        """
+        s = (getattr(self, "params", None) or {}).get("strategy") or {}
+        ts, mh = s.get("time_stop_bars"), s.get("max_hold_bars")
+        if ts is None or mh is None:
+            return True
+        try:
+            if int(ts) == int(mh):
+                return True
+        except (TypeError, ValueError):
+            pass
+        self.log.error("PARAMS PARITY: strategy.time_stop_bars=%r (backtest) != "
+                       "strategy.max_hold_bars=%r (live time stop) — the backtest "
+                       "does not model this leg's live exit", ts, mh)
+        return False
 
     def stop(self, *_args) -> None:
         self._stopped = True
@@ -957,6 +1008,118 @@ class Bot:
             f"bot will exit.",
         )
         return True
+
+    # --- kill switch vs. an unreconciled withdrawal (2026-11 review) --------
+    def _kill_switch_after_reconcile(self, equity: float) -> bool:
+        """The kill check, with the principal brought up to date FIRST.
+
+        Before: the kill check ran on the hourly-reconciled principal, ahead of
+        the transfer detector, so a withdrawal larger than the cushion
+        (1 − kill_fraction) flattened and HALTed the leg (v1, 2026-11-04).
+
+        Now, ONLY when the current anchor says "breached":
+          1. reconcile the principal from the income ledger NOW (bypassing the
+             hourly throttle) and re-evaluate on the fresh anchor;
+          2. if still breached, a bounded exemption for a wallet drop the
+             ledger has not caught up with (_withdrawal_grace). It never applies
+             when the position or the fills changed, when the wallet was not
+             read this tick, or when the drawdown breaches even with the
+             unexplained drop added back — those all kill exactly as before.
+        A non-breach is untouched: _check_kill_switch runs as always (it also
+        owns the "anchor unset" alert).
+        """
+        try:
+            P = principal.get_principal()
+            if not principal.breached(equity, P, self.kill_fraction):
+                self._kill_grace = None
+                return self._check_kill_switch(equity)
+            try:
+                if principal.is_initialized():
+                    principal.reconcile_recent(self.client, log=self.log)
+                    self._last_principal_reconcile_ts = time.time()
+            except Exception as e:
+                self.log.warning("kill pre-check: principal reconcile failed: %s", e)
+            P2 = principal.get_principal()
+            if principal.breached(equity, P2, self.kill_fraction) and \
+                    self._withdrawal_grace(equity, P2):
+                return False
+        except Exception as e:
+            # The pre-check must never stand between the leg and its kill
+            # switch: on any error, the unchanged check decides.
+            self.log.warning("kill pre-check failed (plain kill check runs): %s", e)
+            self._kill_grace = None
+        return self._check_kill_switch(equity)
+
+    def _withdrawal_grace(self, equity: float, P: float | None) -> bool:
+        """True = defer the kill THIS tick: the breach is explained by a wallet
+        drop that is (a) unexplained by any position change or fill, (b) not yet
+        in the principal ledger, and (c) without which equity is NOT breached.
+        Bounded by TRANSFER_SUSPECT_MAX_S from the first deferral, and ends the
+        moment the ledger sum moves (the transfer landed → the normal check on
+        the reconciled anchor decides). Fails toward the kill on any missing
+        read. Mails once per grace."""
+        try:
+            now = time.time()
+            ledger = state.principal_ledger_sum(principal.PRINCIPAL_ASSET,
+                                                self.LAST_BAR_PERSIST_TIMEOUT_S)
+            fill_id = state.max_fill_id(self.LAST_BAR_PERSIST_TIMEOUT_S)
+            pos = self.client.fetch_position(self.symbol)
+            snap_side = getattr(self, "_last_position_side", None)
+            snap_qty = getattr(self, "_last_position_qty", None)
+            if snap_side in (None, "unknown"):
+                return False
+            same_pos = (pos.side == snap_side) and (
+                pos.side == "flat"
+                or (snap_qty is not None and abs(float(pos.qty) - float(snap_qty)) <= 1e-12))
+            g = getattr(self, "_kill_grace", None)
+            if g is not None:
+                if (now - g["since"] > self.TRANSFER_SUSPECT_MAX_S
+                        or ledger != g["ledger_sum"] or fill_id != g["fill_id"]
+                        or (pos.side, float(pos.qty or 0.0)) != g["pos"]):
+                    self._kill_grace = None
+                    return False
+                residual = g["residual"]
+            else:
+                prev_fp = getattr(self, "_prev_tick_fingerprint", None)
+                prev_wallet = getattr(self, "_prev_tick_wallet", None)
+                prev_eq = getattr(self, "_prev_tick_equity", None)
+                wallet = getattr(self.client, "last_wallet_usdt", None)
+                if not (same_pos and prev_fp is not None and fill_id == prev_fp[2]
+                        and isinstance(wallet, (int, float)) and math.isfinite(wallet)
+                        and isinstance(prev_wallet, (int, float))
+                        and prev_eq and prev_eq > 0):
+                    return False
+                residual = float(wallet) - float(prev_wallet)
+                if residual >= -self.TRANSFER_JUMP_FRAC * prev_eq:
+                    return False   # not a withdrawal-sized unexplained drop
+            if principal.breached(equity - residual, P, self.kill_fraction):
+                self._kill_grace = None
+                return False       # the drawdown breaches on its own: kill
+            if g is None:
+                self._kill_grace = {"since": now, "residual": residual,
+                                    "ledger_sum": ledger, "fill_id": fill_id,
+                                    "pos": (pos.side, float(pos.qty or 0.0))}
+                self.log.warning(
+                    "kill switch DEFERRED: equity %.2f breaches the floor only "
+                    "because of an unexplained wallet drop of %.2f USDT (no "
+                    "position change or fill) that the income ledger has not "
+                    "booked yet — likely a withdrawal. Reconciling and "
+                    "re-checking each tick for up to %.0fs.", equity, residual, self.TRANSFER_SUSPECT_MAX_S)
+                send_alert(
+                    f"{self.instance}: kill switch DEFERRED (possible withdrawal)",
+                    f"Equity {equity:.2f} is below the kill floor only because the "
+                    f"wallet dropped {residual:+.2f} USDT with no position change or "
+                    f"fill, and the income ledger has not booked it yet. The kill "
+                    f"switch is held for at most {self.TRANSFER_SUSPECT_MAX_S:.0f}s "
+                    f"while the principal reconciles every tick; it fires at once if "
+                    f"the drawdown breaches without that drop, or if anything else "
+                    f"changes.")
+            return True
+        except Exception as e:
+            self.log.warning("kill pre-check: withdrawal grace check failed "
+                             "(kill proceeds): %s", e)
+            self._kill_grace = None
+            return False
 
     def _maybe_reconcile_principal(self) -> None:
         """Periodically refresh the principal anchor from the Binance income
@@ -1493,11 +1656,24 @@ class Bot:
         )
         notional = qty * decision.price
 
+        # Notional cap: RESIZE, do not skip (2026-11, God approved). Stop and
+        # TP prices are unchanged, so effective risk = target × (capped/intended)
+        # < target. A size the clamp pushes under the exchange minimum is
+        # skipped by the minimums check right below, as before.
+        intended_qty, intended_notional = qty, notional
+        qty, clamped = clamp_qty_to_notional_cap(
+            qty, decision.price, self.constraints.qty_step)
+        if clamped:
+            notional = qty * decision.price
+
         # Exchange minimums (min qty + min notional) come from the live market
         # spec — tighter than our own caps. If a signal can't be filled, SKIP
         # it. Do NOT scale up to meet the minimum; that would violate the
         # risk budget.
         ok, reason = passes_minimums(qty, decision.price, self.constraints)
+        if not ok and clamped:
+            reason = (f"{reason} after resizing to the notional cap "
+                      f"(intended ${intended_notional:,.2f})")
         if not ok:
             self.log.warning("Skipping %s signal: %s (equity=$%.2f). "
                              "Need more capital or accept smaller positions.",
@@ -1508,10 +1684,13 @@ class Bot:
             return
 
         try:
-            check_notional(notional)
+            check_notional(notional)   # backstop: after the clamp this cannot trip
         except RiskBreach as e:
             self.log.warning("Skipping signal: %s", e)
             return
+        if clamped:
+            self._note_notional_resize(decision.side, intended_qty, intended_notional,
+                                       qty, notional, equity)
 
         # signal_id anchors all 3 legs of this trade on Binance via clientOrderId.
         # Format: snap-v1-<signal_id>-{e|s|t|x|bf|h|k}. Investing-consolidate's
@@ -1719,6 +1898,30 @@ class Bot:
     def _clear_unverified(self) -> None:
         self._unverified = None
         self._unverified_meta_stale = not self._set_meta_quietly(self.UNVERIFIED_KEY, "")
+
+    def _note_notional_resize(self, side: str, intended_qty: float,
+                              intended_notional: float, qty: float,
+                              notional: float, equity: float) -> None:
+        """Log + alert a signal resized to MAX_NOTIONAL_USD. Never raises."""
+        try:
+            frac = (qty / intended_qty) if intended_qty > 0 else 0.0
+            eff_risk = float(self.risk_pct) * frac
+            msg = (f"{self.instance}: {side} signal RESIZED to the notional cap — "
+                   f"intended {intended_qty:.6f} {self.base_asset} "
+                   f"(${intended_notional:,.2f}) -> {qty:.6f} (${notional:,.2f}); "
+                   f"effective risk {eff_risk:.2f}% of equity ${equity:,.2f} "
+                   f"(target {float(self.risk_pct):.2f}%). Stop/TP prices unchanged.")
+            self.log.warning("%s", msg)
+            state.record_event("WARN", "signal_resized_notional_cap",
+                               {"side": side, "intended_qty": intended_qty,
+                                "intended_notional": intended_notional,
+                                "qty": qty, "notional": notional,
+                                "effective_risk_pct": eff_risk,
+                                "target_risk_pct": float(self.risk_pct)})
+            if not self.dry_run:
+                send_alert(f"{self.instance}: entry resized to notional cap", msg)
+        except Exception:
+            self.log.exception("notional-cap resize note failed")
 
     def _entry_blocked(self) -> bool:
         """Fails CLOSED: an unreadable record blocks entries (the safe side)."""
@@ -4559,7 +4762,7 @@ class Bot:
                     # (flat OR holding); the monitor's live-equity feed follows
                     # _detect_bracket_exit below. Never on a guessed equity.
                     self._roll_daily_anchor(equity)
-                if equity_known and self._check_kill_switch(equity):
+                if equity_known and self._kill_switch_after_reconcile(equity):
                     if not self.dry_run:
                         root = state.latest_entry_coid_root()
                         # raises → stops kept, alert sent, loop retries (the
