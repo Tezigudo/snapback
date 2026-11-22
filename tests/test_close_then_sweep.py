@@ -418,27 +418,38 @@ def test_halt_retry_runs_risk_reducing_hooks_only_and_escalates():
     mc.fetch_position_checked.side_effect = None
     mc.fetch_position_checked.return_value = _open("long", 65_000.0, 0.01)
     calls = []
-    b._maybe_finish_no_stop_close = lambda eq: calls.append("no_stop")
+    first_t = []
+    b._maybe_finish_no_stop_close = lambda eq: (calls.append("no_stop"),
+                                                first_t or first_t.append(t[0]))
     b._maybe_reprotect = lambda eq: calls.append("reprotect")
+    b._maybe_guard_unverified_entry = lambda eq: calls.append("guard")
     b._maybe_breakeven = lambda eq: calls.append("breakeven")
     b._maybe_enter = lambda eq: calls.append("enter")
     b._maybe_time_stop = lambda eq: calls.append("time_stop")
     t = [1_000_000.0]
     ticks = {"n": 0}
+    urgent_at = []
 
     def _sleep(_s):
         ticks["n"] += 1
         t[0] += 300.0                                  # 5 min per retry
         if ticks["n"] >= 6:
             b._stopped = True
+    def _alert(subject, *a, **k):
+        if subject.startswith("URGENT"):
+            urgent_at.append(t[0])
     with patch("bot.halt_source", return_value="self"), \
-         patch("bot.send_alert") as alert, patch("bot.time.sleep", side_effect=_sleep), \
+         patch("bot.send_alert", side_effect=_alert) as alert, \
+         patch("bot.time.sleep", side_effect=_sleep), \
          patch("bot.time.time", side_effect=lambda: t[0]):
         b.loop()
-    assert "no_stop" in calls and "reprotect" in calls
+    # every unconfirmed retry ran each hook exactly once (3 ticks: the strict
+    # confirm's own sleep also advances the fake clock)
+    assert calls.count("no_stop") == calls.count("reprotect") == calls.count("guard") == 3
     assert not {"breakeven", "enter", "time_stop"} & set(calls)
-    urgent = [c for c in alert.call_args_list if c.args[0].startswith("URGENT")]
-    assert len(urgent) == 1                            # escalated once, not every tick
+    # escalated ONCE, and not before HALT_UNCONFIRMED_ESCALATE_S elapsed
+    assert len(urgent_at) == 1
+    assert urgent_at[0] >= first_t[0] + b.HALT_UNCONFIRMED_ESCALATE_S
 
 
 # --- G11 (round 3): same-bar held stamp rolled back on an unconfirmed time stop
@@ -582,3 +593,44 @@ def test_exit_found_flat_never_persists_zero_or_stale_equity():
     assert all(c.kwargs.get("equity_usd") is None for c in ev.call_args_list)
     exit_mails = [c.args[1] for c in alert.call_args_list if "exit" in c.args[0].lower()]
     assert exit_mails and "Equity now: $unknown" in exit_mails[0]
+
+
+# --- sourcery 4657592239: HALT/kill must not exit while an entry is unverified
+
+def _flat():
+    return _open("flat", 0.0, 0.0)
+
+
+def _unverified_halt_bot():
+    b, mc = _bot()
+    mc.close_position.side_effect = None
+    mc.close_position.return_value = None
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    b._last_position_side = "unknown"
+    b._set_unverified({"kind": "entry_unverified", "root": "r1", "side": "long",
+                       "since": 0.0, "sl_distance": 100.0, "tp_distance": 200.0})
+    return b, mc
+
+
+def test_halt_does_not_exit_while_the_entry_order_is_not_proven_gone():
+    b, mc = _unverified_halt_bot()
+    mc.cancel_entry_order.return_value = None          # cancel unconfirmed
+    ticks = {"n": 0}
+
+    def _sleep(_s):
+        ticks["n"] += 1
+        if ticks["n"] >= 3:
+            b._stopped = True
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.time.sleep", side_effect=_sleep):
+        assert b.loop() != 0 or b._stopped is True
+    assert mc.close_position.call_count == 3           # the close is retried each tick
+
+
+def test_halt_exits_once_the_entry_order_is_proven_gone_and_flat():
+    b, mc = _unverified_halt_bot()
+    mc.cancel_entry_order.return_value = True
+    with patch("bot.halt_source", return_value="self"), patch("bot.send_alert"), \
+         patch("bot.consolidate_push.drain"):
+        assert b.loop() == 0

@@ -4907,8 +4907,8 @@ class Bot:
 
     def _halt_retry_tick(self, which: str) -> None:
         """G5 (round 3): one HALT retry iteration with flat still unconfirmed.
-        Runs the risk-REDUCING hooks only — the pending no-stop close and
-        reprotect (re-places a missing stop where enabled). No entries, no
+        Runs the risk-REDUCING hooks only — the pending no-stop close, the
+        unverified-entry guard (stop, else close) and reprotect (re-places a missing stop where enabled). No entries, no
         breakeven (it moves stops), no trend/time exits (the HALT close is
         already the exit). Escalates ONCE after HALT_UNCONFIRMED_ESCALATE_S.
         NEVER raises."""
@@ -4921,7 +4921,8 @@ class Bot:
         # stand-in, so nothing may persist it as equity_after (H3).
         self._equity_stale = True
         eq = getattr(self, "_last_known_equity", None)
-        for name in ("_maybe_finish_no_stop_close", "_maybe_reprotect"):
+        for name in ("_maybe_finish_no_stop_close", "_maybe_reprotect",
+                     "_maybe_guard_unverified_entry"):
             try:
                 getattr(self, name)(eq)
             except Exception:
@@ -4941,6 +4942,27 @@ class Bot:
                            f"stays up and keeps retrying. CHECK BINANCE NOW.")
             except Exception:
                 self.log.exception("HALT escalation alert failed")
+
+    def _unverified_entry_blocks_exit(self, why: str) -> bool:
+        """HALT / kill may exit only when no unverified entry order can still
+        fill: with an `entry_unverified` record, require the entry order to be
+        PROVEN gone (cancel_entry_order is True) and a strict flat re-read.
+        Otherwise the caller keeps looping (its close then closes whatever
+        filled). NEVER raises; an unreadable state blocks. Never blocks a close,
+        only the process exit."""
+        try:
+            u = self._unverified_record()
+            if u is None:
+                return False
+            if self.client.cancel_entry_order(self.symbol, str(u.get("root"))) is True \
+                    and self._strict_flat_reads()[0]:
+                return False
+            self.log.error("%s: not exiting — entry %s is unverified (not proven "
+                           "gone / flat); retrying", why, u.get("root"))
+            return True
+        except Exception:
+            self.log.exception("%s: unverified-entry exit check failed", why)
+            return True
 
     def _exit_found_flat(self, why: str) -> None:
         """G3 (round 3): HALT / kill found the position ALREADY flat (strictly
@@ -5095,12 +5117,17 @@ class Bot:
                         except Exception as e:
                             self.log.error("HALT: close raised (%s) — not exiting; "
                                            "retrying", e)
-                            if isinstance(e, ccxt.InvalidNonce):
+                            if is_nonce_error(e):
                                 try:
                                     self.client.ex.load_time_difference()
                                 except Exception as sync_err:
                                     self.log.warning("load_time_difference() failed: %s",
                                                      sync_err)
+                            self._halt_retry_tick(which)
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue
+                        if halt_flat and self._unverified_entry_blocks_exit(which):
                             self._halt_retry_tick(which)
                             transient_backoff_s = min(transient_backoff_s * 2, 30)
                             time.sleep(transient_backoff_s)
@@ -5177,6 +5204,10 @@ class Bot:
                         # raises → stops kept, alert sent, loop retries (the
                         # kill switch wrote HALT, so the HALT path re-closes)
                         _o, kill_flat = self._close_then_sweep(root, "k", "kill-switch")
+                        if kill_flat and self._unverified_entry_blocks_exit("kill-switch"):
+                            transient_backoff_s = min(transient_backoff_s * 2, 30)
+                            time.sleep(transient_backoff_s)
+                            continue   # HALT_<leg> exists: the HALT path retries
                         if kill_flat and _o is None:
                             self._exit_found_flat("kill-switch")   # G3
                         if not kill_flat:
