@@ -169,3 +169,48 @@ def test_entry_row_is_written_with_null_equity_when_equity_is_unknown_or_stale(e
         rows = c.execute("SELECT reason, equity_after FROM fills").fetchall()
     assert rows == [("entry", None)]
 
+
+
+# --- small alert / audit / book-read fixes -------------------------------------
+
+def test_resize_mail_still_sent_when_the_event_write_fails_and_event_links_the_signal():
+    b, mc = _make_bot()
+    with patch("bot.state.record_event", side_effect=RuntimeError("db")), \
+         patch("bot.send_alert") as alert:
+        b._note_notional_resize("long", 0.02, 1300.0, 0.01, 650.0, 1000.0,
+                                signal_id="s1")
+    alert.assert_called_once()
+    with patch("bot.state.record_event") as rec, patch("bot.send_alert"):
+        b._note_notional_resize("long", 0.02, 1300.0, 0.01, 650.0, 1000.0,
+                                signal_id="s1")
+    assert rec.call_args.kwargs["signal_id"] == "s1"
+
+
+def test_close_failed_throttle_is_set_only_after_a_successful_send():
+    b, mc = _make_bot()
+    with patch("bot.send_alert", return_value=False) as alert:
+        b._alert_close_failed("h", "HALT", "x")
+        b._alert_close_failed("h", "HALT", "x")
+    assert alert.call_count == 2                       # failed send: not throttled
+    with patch("bot.send_alert", return_value=True) as alert:
+        b._alert_close_failed("h", "HALT", "x")
+        b._alert_close_failed("h", "HALT", "x")
+    assert alert.call_count == 1
+
+
+def test_close_failed_throttle_survives_a_restart():
+    b1, _ = _make_bot()
+    b2, _ = _make_bot()                                # a restarted process
+    with patch("bot.send_alert", return_value=True) as alert:
+        b1._alert_close_failed("h", "boot-flatten", "x")
+        b2._alert_close_failed("h", "boot-flatten", "x")
+    assert alert.call_count == 1
+
+
+def test_malformed_algo_row_makes_the_book_unreadable():
+    from exchange.binance_client import BinanceClient
+    ex = MagicMock()
+    ex.fapiPrivateGetOpenAlgoOrders.return_value = [{"clientAlgoId": "a"}, "junk"]
+    c = BinanceClient(ex=ex, env="testnet", coid_prefix="snap-v1-")
+    ex.market.return_value = {"id": "BTCUSDT"}
+    assert c.fetch_algo_orders("BTC/USDT:USDT") == ([], False)

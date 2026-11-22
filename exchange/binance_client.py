@@ -537,6 +537,11 @@ class BinanceClient:
         if not isinstance(rows, list):
             log.warning("openAlgoOrders returned %s, not a list", type(rows).__name__)
             return [], False
+        if not all(isinstance(r, dict) for r in rows):
+            # a malformed row would raise in every classifier; "unreadable"
+            # already defers (sourcery 4657590284)
+            log.warning("openAlgoOrders returned a non-dict row — book unreadable")
+            return [], False
         return rows, True
 
     def _cancel_algo_orders(self, symbol: str, coid_prefix: str | None) -> int | None:

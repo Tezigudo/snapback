@@ -51,7 +51,9 @@ RISK_KEYS: tuple[str, ...] = tuple(f"risk.{k}" for k, _ in RISK_FIELDS.values())
 @dataclass(frozen=True)
 class RiskCeilings:
     # Absolute notional cap per single order, in USDT. ENFORCED: check_notional
-    # before every entry; an oversize signal is skipped, not resized.
+    # before every entry; an oversize signal is resized down to the cap
+    # (step-floored) and skipped only if the resize falls under the exchange
+    # minimums; check_notional stays as the backstop.
     MAX_NOTIONAL_USD: float | None = None
 
     # Hard leverage cap. Bot may request less, never more. ENFORCED: check_leverage

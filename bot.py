@@ -1745,15 +1745,14 @@ class Bot:
         except RiskBreach as e:
             self.log.warning("Skipping signal: %s", e)
             return
-        if clamped:
-            self._note_notional_resize(decision.side, intended_qty, intended_notional,
-                                       qty, notional, equity)
-
         # signal_id anchors all 3 legs of this trade on Binance via clientOrderId.
         # Format: snap-v1-<signal_id>-{e|s|t|x|bf|h|k}. Investing-consolidate's
         # importer joins entry+exit fills via this root. ms precision avoids
         # collisions across bot restarts.
         signal_id = str(int(time.time() * 1000))
+        if clamped:
+            self._note_notional_resize(decision.side, intended_qty, intended_notional,
+                                       qty, notional, equity, signal_id=signal_id)
 
         self.log.info(
             "%s %s [%s] sid=%s qty=%.4f price=%.2f sl=%.2f tp=%.2f notional=$%.2f",
@@ -2001,7 +2000,8 @@ class Bot:
 
     def _note_notional_resize(self, side: str, intended_qty: float,
                               intended_notional: float, qty: float,
-                              notional: float, equity: float) -> None:
+                              notional: float, equity: float,
+                              signal_id: str | None = None) -> None:
         """Log + alert a signal resized to MAX_NOTIONAL_USD. Never raises."""
         try:
             frac = (qty / intended_qty) if intended_qty > 0 else 0.0
@@ -2012,16 +2012,25 @@ class Bot:
                    f"effective risk {eff_risk:.2f}% of equity ${equity:,.2f} "
                    f"(target {float(self.risk_pct):.2f}%). Stop/TP prices unchanged.")
             self.log.warning("%s", msg)
+        except Exception:
+            self.log.exception("notional-cap resize note failed")
+            return
+        # separate tries: a ledger/DB failure must not skip the mail
+        try:
             state.record_event("WARN", "signal_resized_notional_cap",
                                {"side": side, "intended_qty": intended_qty,
                                 "intended_notional": intended_notional,
                                 "qty": qty, "notional": notional,
                                 "effective_risk_pct": eff_risk,
-                                "target_risk_pct": float(self.risk_pct)})
+                                "target_risk_pct": float(self.risk_pct)},
+                               signal_id=signal_id)
+        except Exception:
+            self.log.exception("notional-cap resize event failed")
+        try:
             if not self.dry_run:
                 send_alert(f"{self.instance}: entry resized to notional cap", msg)
         except Exception:
-            self.log.exception("notional-cap resize note failed")
+            self.log.exception("notional-cap resize mail failed")
 
     def _entry_blocked(self) -> bool:
         """Fails CLOSED: an unreadable record blocks entries (the safe side)."""
@@ -5149,14 +5158,27 @@ class Bot:
         sent = getattr(self, "_close_fail_alert_ts", None)
         if sent is None:
             sent = self._close_fail_alert_ts = {}
-        if now - sent.get(close_leg, 0.0) < self.CLOSE_FAIL_ALERT_S:
+        # Throttle persisted in meta (sourcery 4657591044): a raising boot-flatten
+        # close restarts the process every ~10 s, and an in-memory throttle would
+        # mail on every restart.
+        mkey = f"close_fail_alert_ts:{self.instance}:{close_leg}"
+        last = sent.get(close_leg)
+        if last is None:
+            try:
+                last = float(state.get_meta(mkey) or 0.0)
+            except Exception:
+                last = 0.0
+        if now - last < self.CLOSE_FAIL_ALERT_S:
             return
-        sent[close_leg] = now
         try:
-            send_alert(f"{self.instance}: bot {why} close FAILED",
-                       f"{why} close of {self.symbol} ({self.instance}): {detail}")
+            ok = send_alert(f"{self.instance}: bot {why} close FAILED",
+                            f"{why} close of {self.symbol} ({self.instance}): {detail}")
         except Exception:
             self.log.exception("close-failed alert could not be sent")
+            return
+        if ok:   # sourcery 4657591040: a failed send must not suppress the retry
+            sent[close_leg] = now
+            self._set_meta_quietly(mkey, repr(now))
 
     def _breakeven_close(self, pos, root: str, be_price: float, mfe: float,
                          equity: float) -> bool:
