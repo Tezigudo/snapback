@@ -165,10 +165,15 @@ def _format_leg(s: dict) -> str:
         lines.append(f"- top gate blocks: {reasons}")
     if s["nan_4h_count"] > 0:
         lines.append(f"- ⚠ mtf_4h_gate_nan: {s['nan_4h_count']} events")
-    err = s["by_level"].get("ERROR", 0)
+    err = _alert_level_count(s["by_level"])
     if err > 0:
-        lines.append(f"- ⚠ ERROR events: {err}")
+        lines.append(f"- ⚠ ERROR/CRITICAL events: {err}")
     return "\n".join(lines)
+
+
+def _alert_level_count(by_level: dict) -> int:
+    """ERROR + CRITICAL (2026-11: CRITICAL used to be ignored here)."""
+    return int(by_level.get("ERROR", 0)) + int(by_level.get("CRITICAL", 0))
 
 
 def main() -> int:
@@ -199,7 +204,7 @@ def main() -> int:
     for s in summaries:
         if s["nan_4h_count"] > 0:
             flags.append(f"4H gate NaN on {s['name']}")
-        if s["by_level"].get("ERROR", 0) > 0:
+        if _alert_level_count(s["by_level"]) > 0:
             flags.append(f"ERRORs on {s['name']}")
         if s["live"] and s["anchor_equity"] and s["current_equity"]:
             dp = ((s["current_equity"] - s["anchor_equity"]) / s["anchor_equity"]) * 100
