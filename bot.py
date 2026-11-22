@@ -846,26 +846,46 @@ class Bot:
         except Exception:
             self.log.exception("boot: already-flat alert failed")
 
+    # Which params key each strategy's BACKTEST reads for its time stop. Live
+    # always time-stops on strategy.max_hold_bars (_maybe_time_stop).
+    _BACKTEST_TIME_STOP_KEY = {
+        "donchian-v3": "time_stop_bars",       # signals_donchian.DonchianBreakoutBTC
+        "multifactor-v1": "max_hold_bars",     # signals_multifactor.DayTradeMultiFactorBTC
+    }
+
     def _check_time_stop_parity(self) -> bool:
-        """Live time-stops on `strategy.max_hold_bars` (_maybe_time_stop); the
-        backtest on `strategy.time_stop_bars`. If both are set and differ, the
-        backtest is not modelling the live exit (2026-11 review: the donchian
-        harness ignored the live 48-bar time stop once). ERROR-level so the
-        monitor's ERROR alert mails it; does NOT refuse boot — this is a
-        research-parity defect, not a live-money hazard. Returns True on parity.
+        """Does this leg's backtest model its live time stop? (F12, per leg.)
+
+        Live time-stops on `strategy.max_hold_bars` (absent/None = 0 = off).
+        The backtest key differs per strategy (_BACKTEST_TIME_STOP_KEY): for
+        multifactor-v1 it IS max_hold_bars (parity by construction); for
+        donchian-v3 it is time_stop_bars. A backtest key that is unset while
+        live time-stops is a mismatch, not a skip. ERROR-level (the monitor's
+        ERROR alert mails it); does NOT refuse boot. A strategy with no known
+        backtest key is logged at INFO and passes. Returns True on parity.
         """
         s = (getattr(self, "params", None) or {}).get("strategy") or {}
-        ts, mh = s.get("time_stop_bars"), s.get("max_hold_bars")
-        if ts is None or mh is None:
+        strat = getattr(self, "strategy_name", None)
+        bt_key = self._BACKTEST_TIME_STOP_KEY.get(strat)
+        if bt_key is None:
+            self.log.info("params parity: no known backtest time-stop key for %s — "
+                          "not checked", strat)
             return True
-        try:
-            if int(ts) == int(mh):
-                return True
-        except (TypeError, ValueError):
-            pass
-        self.log.error("PARAMS PARITY: strategy.time_stop_bars=%r (backtest) != "
-                       "strategy.max_hold_bars=%r (live time stop) — the backtest "
-                       "does not model this leg's live exit", ts, mh)
+
+        def _bars(v):
+            try:
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return "invalid"
+        live = _bars(s.get("max_hold_bars"))
+        live = 0 if live is None else live
+        bt = _bars(s.get(bt_key))
+        if bt == live:
+            return True
+        self.log.error("PARAMS PARITY (%s): backtest strategy.%s=%r != live "
+                       "strategy.max_hold_bars=%r — the backtest does not model "
+                       "this leg's live time stop", strat, bt_key,
+                       s.get(bt_key), s.get("max_hold_bars"))
         return False
 
     def stop(self, *_args) -> None:

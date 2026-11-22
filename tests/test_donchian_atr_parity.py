@@ -51,16 +51,25 @@ def test_higher_timeframe_frame_keeps_the_shift():
     assert out.loc[t, "ATR_1h"] == shifted.loc[t]
 
 
-def _b(strategy):
+def _b(strategy, name="donchian-v3"):
     b = object.__new__(bot_mod.Bot)
     b.params = {"strategy": strategy}
+    b.strategy_name = name
     b.log = logging.getLogger("t")
     return b
 
 
-def test_time_stop_parity_check(caplog):
+def test_time_stop_parity_check_per_leg(caplog):
+    # donchian-v3: backtest reads time_stop_bars
     assert _b({"time_stop_bars": 48, "max_hold_bars": 48})._check_time_stop_parity()
-    assert _b({"max_hold_bars": 0})._check_time_stop_parity()       # one side unset
+    assert _b({"time_stop_bars": 0})._check_time_stop_parity()          # both off
     with caplog.at_level(logging.ERROR, logger="t"):
         assert not _b({"time_stop_bars": 0, "max_hold_bars": 48})._check_time_stop_parity()
+        # F12: an UNSET backtest key while live time-stops is a mismatch, not a skip
+        assert not _b({"max_hold_bars": 48})._check_time_stop_parity()
+        assert not _b({"time_stop_bars": None, "max_hold_bars": 48})._check_time_stop_parity()
     assert "PARAMS PARITY" in caplog.text
+    # multifactor-v1: its backtest reads max_hold_bars itself -> parity by construction
+    assert _b({"max_hold_bars": 96, "time_stop_bars": 0}, "multifactor-v1")._check_time_stop_parity()
+    # unknown backtest key: not checked
+    assert _b({"max_hold_bars": 5}, "supertrend")._check_time_stop_parity()
