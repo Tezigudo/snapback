@@ -65,6 +65,16 @@ class FakeEx:
         return [{"symbol": SYM, "contracts": self.position, "side": "long",
                  "entryPrice": 65000.0, "unrealizedPnl": 0.0, "initialMargin": 1.0}]
 
+    def market(self, symbol):
+        return {"id": "BTCUSDT", "precision": {"amount": 3}}
+
+    def fapiPrivateV2GetAccount(self, params=None):
+        # independent of positionRisk (G8 strict read confirms an empty list here)
+        if self.position_raises:
+            raise RuntimeError("account down")
+        return {"positions": [{"symbol": "BTCUSDT",
+                               "positionAmt": str(float(self.position or 0.0))}]}
+
     # helpers
     def types(self):
         return [c[0] for c in self.created]
@@ -265,3 +275,29 @@ def test_partial_with_failed_cancel_but_verified_gone_returns_normally():
             SYM, "long", QTY, 65000.0, sl_distance=500.0, tp_distance=1000.0,
             timeout_s=2.0, poll_s=2.0, client_order_id_root="1716120000000")
     assert out["filled_as"] == "limit_partial"
+
+
+
+# --- G8 (round 3): no non-reduce-only market fallback without a PROVEN flat --
+
+def test_stale_empty_position_read_refuses_the_market_fallback():
+    """positionRisk reads empty but the account endpoint shows a position (a
+    late limit fill): sending the market fallback would double the exposure."""
+    ex = FakeEx(polls=[OPEN0], position=0.0,
+                final_order={"status": "canceled", "filled": 0.0})
+    ex.fapiPrivateV2GetAccount = lambda params=None: {
+        "positions": [{"symbol": "BTCUSDT", "positionAmt": str(QTY)}]}
+    with pytest.raises(RuntimeError, match="refusing market fallback"):
+        _run(ex)
+    assert ex.types() == ["limit"]                 # no market order sent
+
+
+def test_unconfirmable_flat_refuses_the_market_fallback():
+    ex = FakeEx(polls=[OPEN0], position=0.0,
+                final_order={"status": "canceled", "filled": 0.0})
+    def _down(params=None):
+        raise RuntimeError("account endpoint down")
+    ex.fapiPrivateV2GetAccount = _down
+    with pytest.raises(RuntimeError, match="refusing market fallback"):
+        _run(ex)
+    assert ex.types() == ["limit"]

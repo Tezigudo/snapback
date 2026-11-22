@@ -1177,12 +1177,22 @@ class BinanceClient:
 
         # The position is the ground truth for exposure. Read it before any
         # market fallback and bracket THAT qty, not a possibly-stale order read.
+        # G8 (2026-11 round 3): STRICT read. The zero-fill branch below sends a
+        # NON-reduce-only market order, so "flat" must be proven: an unreadable
+        # / stale-empty payload (PositionUnknown) or an opposite-side position
+        # leaves pos_qty None, which refuses the market fallback.
         pos_qty: float | None = None
         try:
-            p = self.fetch_position(symbol)
-            pos_qty = p.qty if p.side == side else 0.0
+            p = self.fetch_position_checked(symbol)
+            if p.side == side:
+                pos_qty = p.qty
+            elif p.side == "flat":
+                pos_qty = 0.0
+            else:
+                log.error("post-cancel read: an OPPOSITE %s %.6f position is open — "
+                          "refusing any market fallback", p.side, p.qty)
         except Exception as e:
-            log.warning("post-cancel fetch_position failed: %s", e)
+            log.warning("post-cancel position read not confirmed: %s", e)
         actual_qty = pos_qty if (pos_qty is not None and pos_qty > 0) else filled_qty
 
         if actual_qty >= qty * 0.999:
