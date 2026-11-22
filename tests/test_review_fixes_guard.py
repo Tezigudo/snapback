@@ -83,3 +83,73 @@ def test_partly_attributable_position_keeps_the_record_and_alerts_once():
     assert (r1, r2) == (False, False)
     assert mc.protect_open_position.call_count == 2    # retried
     assert alert.call_count == 1                       # alerted once
+
+
+# --- entry-cancel-race / fill-price (no-stop emergency close) -----------------
+
+def _pending_bot(qty=0.010, **extra):
+    b, mc = _make_bot()
+    rec = {"kind": "no_stop_close", "root": "r1", "side": "long", "qty": qty,
+           "entry_price": 65_000.0, "stop_price": 64_000.0, "why": "t", **extra}
+    b._no_stop_pending = rec
+    b._pending_meta_stale = False
+    b._no_stop_next_try = 0.0
+    b.constraints = MagicMock(qty_step=0.001)
+    return b, mc
+
+
+def test_residual_attributable_to_the_entry_order_is_closed_not_abandoned():
+    # 4657588370: pending 0.010, position 0.004 same side, entry filled 0.014
+    b, mc = _pending_bot(0.010)
+    mc.fetch_position.return_value = _open("long", 65_000.0, 0.004)
+    mc.entry_order_filled.return_value = 0.014
+    mc.emergency_close.return_value = (True, {"id": "1", "average": 64_900.0}, None)
+    with patch("bot.send_alert") as alert:
+        b._maybe_finish_no_stop_close(1000.0)
+    assert mc.emergency_close.call_args.kwargs["qty"] == 0.004
+    assert not any("ABANDONED" in c.args[0] for c in alert.call_args_list)
+
+
+def test_unattributable_size_mismatch_is_still_abandoned():
+    b, mc = _pending_bot(0.010)
+    mc.fetch_position.return_value = _open("long", 65_000.0, 0.004)
+    mc.entry_order_filled.return_value = 0.0
+    with patch("bot.send_alert") as alert:
+        b._maybe_finish_no_stop_close(1000.0)
+    mc.emergency_close.assert_not_called()
+    assert any("ABANDONED" in c.args[0] for c in alert.call_args_list)
+
+
+def test_flat_confirmed_retry_prices_the_close_from_the_persisted_order():
+    # 4657588381
+    import sqlite3
+
+    from exchange import state
+    b, mc = _pending_bot(0.010, close_coid="snap-x-1-ns", close_order_id="42")
+    state.record_fill(side="long", qty=0.01, price=65_000.0, reason="entry",
+                      client_order_id_root="r1")
+    mc.fetch_position.return_value = _flat()
+    mc.fetch_position_checked.side_effect = None
+    mc.fetch_position_checked.return_value = _flat()
+    b._flat_seen = {"no_stop_retry": (1, None)}
+    mc.ex.fetch_order.return_value = {"average": 64_000.0, "status": "closed"}
+    with patch("bot.send_alert"):
+        b._maybe_finish_no_stop_close(1000.0)
+        b._maybe_finish_no_stop_close(1000.0)
+    with sqlite3.connect(state.DB_PATH) as c:
+        px, pnl = c.execute("SELECT price, pnl_usd FROM fills "
+                            "WHERE reason='no_stop_close'").fetchone()
+    assert px == 64_000.0 and pnl == pytest.approx(-10.0)
+
+
+def test_unproven_entry_cancel_after_emergency_close_rearms_the_guard():
+    # 4657581356 (NEEDS-GOD decision): close first, then guard `-e`
+    b, mc = _make_bot()
+    mc.cancel_entry_order.return_value = None
+    with patch("bot.send_alert"):
+        b._finish_no_stop("long", 0.01, 65_000.0, "r1", 1000.0, closed=True,
+                          order={"id": "1", "average": 64_900.0}, close_error=None,
+                          why="t", record_if_flat=False, stop_price=64_000.0)
+    u = b._unverified_record()
+    assert u and u["root"] == "r1" and u["after_emergency_close"] is True
+    assert b._pending_record() is None

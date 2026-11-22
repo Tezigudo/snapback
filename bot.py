@@ -2250,9 +2250,15 @@ class Bot:
         write it (record_if_flat=True); if it did, its flat edge records it.
         """
         if not closed:
+            prev = self._pending_record() or {}
+            _o = order or {}
             pending = {"kind": "no_stop_close", "root": root, "side": side,
                        "qty": float(qty), "entry_price": entry_price,
-                       "stop_price": stop_price, "why": why}
+                       "stop_price": stop_price, "why": why,
+                       # sourcery 4657588381: keep the close order, so a later
+                       # confirmed flat prices the close from it (not 0.0)
+                       "close_coid": _o.get("clientOrderId") or prev.get("close_coid"),
+                       "close_order_id": _o.get("id") or prev.get("close_order_id")}
             first = self._pending_record() is None
             # In memory FIRST: if the sqlite write fails this process still
             # retries (a restart then goes through boot(), which flattens).
@@ -2314,6 +2320,20 @@ class Bot:
                        + f"Equity: {_fmt_usd(equity)}\nsignal_id: {root or '(untagged)'}")
         except Exception:
             self.log.exception("no-stop: closed-mail failed")
+        # sourcery 4657581356: the root sweep inside the close cancels `-e` without
+        # proving it. If it is not proven gone, hand it to the unverified-entry
+        # guard (after_emergency_close: no false "filled outside the ledger"
+        # mail, entries stay blocked until the order is proven gone).
+        if root and self._unverified_record() is None \
+                and self.client.cancel_entry_order(self.symbol, str(root)) is not True:
+            self._set_unverified({
+                "kind": "entry_unverified", "root": str(root), "side": side,
+                "after_emergency_close": True, "since": time.time(),
+                "sl_distance": (abs(float(entry_price) - float(stop_price))
+                                if entry_price and stop_price else 0.0),
+                "tp_distance": 0.0, "place_tp": False, "error": "emergency close"})
+            self.log.warning("no-stop: entry %s not proven gone after the emergency "
+                             "close — guarded", root)
         self._clear_pending()
         self._set_meta_quietly("active_bracket", "")
 
@@ -2367,9 +2387,22 @@ class Bot:
             self._clear_pending()
             if self._newest_fill_is_entry_of(root):
                 try:
-                    state.record_fill(side="close", qty=qty, price=0.0, pnl_usd=None,
-                                      reason="no_stop_close", equity_after=equity,
+                    px = None
+                    if p.get("close_coid") or p.get("close_order_id"):
+                        px = self._resolve_fill_price(
+                            {"clientOrderId": p.get("close_coid"),
+                             "id": p.get("close_order_id")})
+                    pnl = _exit_pnl_usd(side, p.get("entry_price"), px, qty)
+                    state.record_fill(side="close", qty=qty, price=float(px or 0.0),
+                                      pnl_usd=pnl, reason="no_stop_close",
+                                      equity_after=self._ledger_equity(equity),
                                       client_order_id_root=root)
+                    if px:
+                        state.enqueue_bot_event(
+                            "exit", signal_id=root, side=side, qty=float(qty),
+                            price_usd=px, equity_usd=self._ledger_equity(equity),
+                            payload={"reason": "no_stop_close", "exit_price": px,
+                                     "pnl_usd": pnl})
                 except Exception:
                     self.log.exception("no-stop: recording the outside close failed")
             self.log.warning("no-stop retry: position is FLAT — closed outside the "
@@ -2389,6 +2422,16 @@ class Bot:
         latest = self._latest_entry_root_quietly()
         has_row = self._entry_row_exists(root)
         newer_entry = bool(has_row) and latest is not None and str(latest) != str(root)
+        if pos.side == side and abs(pos.qty - qty) > tol and not newer_entry:
+            # sourcery 4657588370: a size mismatch can be OUR residual (the
+            # `-e` fill raced the close and the close used a stale qty). Attribute
+            # it by the entry order's own filled qty before abandoning.
+            filled = self.client.entry_order_filled(self.symbol, str(root))
+            if filled is not None and 0 < pos.qty <= float(filled) + tol:
+                self.log.warning("no-stop retry: residual %.6f is attributable to "
+                                 "entry %s (filled %.6f) — closing it", pos.qty,
+                                 root, filled)
+                qty = float(pos.qty)
         if pos.side != side or abs(pos.qty - qty) > tol or newer_entry:
             self._clear_pending()
             self.log.error("no-stop retry ABANDONED: open %s %.4f (latest root %s) is "

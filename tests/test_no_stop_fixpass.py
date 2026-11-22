@@ -93,7 +93,9 @@ class TestItem1StalePendingNeverTouchesAnotherPosition:
         with patch("bot.send_alert") as alert:
             bot._maybe_finish_no_stop_close(150.0)
         new_calls = ex.calls[n:]
-        assert all(c[0] == "fetch_positions" for c in new_calls), new_calls
+        # read-only only (the entry order's filled qty is read to attribute a
+        # residual before abandoning: sourcery 4657588370)
+        assert all(c[0] in ("fetch_positions", "fetch_order") for c in new_calls), new_calls
         assert ex.algo == before_algo and ex.pos == pos
         assert bot._pending_record() is None
         assert any("ABANDONED" in s for s in _subjects(alert))
