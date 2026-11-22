@@ -2607,8 +2607,36 @@ class Bot:
                 self.log.warning("unverified entry %s: flat confirmed but the order's "
                                  "filled qty is unreadable — record kept", root)
                 return
-            self._clear_unverified()
             if filled > tol:
+                # H1 (round 4): the GTC limit can fill BETWEEN the strict read
+                # above and the cancel. Re-confirm the position before calling
+                # it "flat": open -> protect it now (never clear and walk away
+                # from a naked fill); unknown -> keep the record, retry.
+                try:
+                    now_pos = self.client.fetch_position_checked(self.symbol)
+                except Exception as e:
+                    self.log.warning("unverified entry %s: it FILLED %.6f; position "
+                                     "re-read not confirmed (%s) — record kept",
+                                     root, filled, e)
+                    return
+                if now_pos.side != "flat" and now_pos.qty:
+                    self.log.error("unverified entry %s: FILLED %.6f at the cancel — "
+                                   "%s %.6f is OPEN; protecting it", root, filled,
+                                   now_pos.side, now_pos.qty)
+                    send_alert("Entry error — entry FILLED at cancel, position OPEN",
+                               f"Entry {root} filled {filled:.6f} {self.base_asset} while "
+                               f"the bot was cancelling it; a {now_pos.side} "
+                               f"{now_pos.qty:.6f} position is open. The no-stop rule "
+                               f"now protects it (stop, else close).")
+                    ours = now_pos.side == u.get("side") and now_pos.qty <= filled + tol
+                    if self._protect_or_close_open(
+                            now_pos, root, float(u["sl_distance"]),
+                            float(u["tp_distance"]), bool(u.get("place_tp", True)),
+                            equity, why="entry order filled at the cancel",
+                            record_if_flat=False, may_close=ours, entry_qty=filled):
+                        self._clear_unverified()
+                    return
+                self._clear_unverified()
                 self.log.error("unverified entry %s: it FILLED %.6f but the position "
                                "is now confirmed flat — closed outside the ledger",
                                root, filled)
@@ -2618,6 +2646,7 @@ class Bot:
                            f"manual close). The ledger may be missing this trade; "
                            f"reconcile it from Binance. Entries resume.")
                 return
+            self._clear_unverified()
             self.log.warning("unverified entry %s: confirmed gone, nothing filled", root)
             send_alert("Entry error resolved — nothing filled",
                        f"The entry order {root} is confirmed gone, it filled nothing, and "
