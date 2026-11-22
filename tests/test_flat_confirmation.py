@@ -94,6 +94,7 @@ def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
     """TP filled: the TP is gone from the algo book, the SL sibling rests.
     That IS the fill evidence — sweep and record on this tick (no latency)."""
     b, mc = _bot()
+    state.set_meta(b.TP_PLACED_KEY, ROOT)        # this position's TP was placed
     mc.fetch_position_checked.return_value = _flat()
     mc.fetch_algo_orders.return_value = ([SL], True)
     _tick(b)
@@ -103,8 +104,9 @@ def test_confirmed_flat_with_a_bracket_leg_gone_sweeps_same_tick():
     assert not b._flat_pending(b.BRACKET_SITE)
 
 
-@pytest.mark.parametrize("book", [([SL, TP], True), ([], False)],
-                         ids=["bracket-intact", "algo-book-unreadable"])
+@pytest.mark.parametrize("book", [([SL, TP], True), ([], False), ([SL], True)],
+                         ids=["bracket-intact", "algo-book-unreadable",
+                              "tp-missing-but-never-recorded-placed"])
 def test_no_fill_evidence_defers_then_accepts_with_an_alert(book):
     b, mc = _bot()
     mc.fetch_position_checked.return_value = _flat()
@@ -120,6 +122,28 @@ def test_no_fill_evidence_defers_then_accepts_with_an_alert(book):
     subjects = [c.args[0] for c in alert.call_args_list]
     assert any("position flat" in s for s in subjects), subjects
     assert not b._flat_pending(b.BRACKET_SITE)
+
+
+@pytest.mark.parametrize("recorded", ["", "1700000000000"], ids=["tp-failed", "other-root"])
+def test_missing_tp_is_not_fill_evidence_unless_this_positions_tp_was_placed(recorded):
+    """F6: TP placement failed ("stop is resting, position kept") or a stale
+    record for another root — a missing TP must not bypass the debounce."""
+    b, mc = _bot()
+    state.set_meta(b.TP_PLACED_KEY, recorded)
+    mc.fetch_position_checked.return_value = _flat()
+    mc.fetch_algo_orders.return_value = ([SL], True)
+    _tick(b)
+    _assert_untouched(b, mc)
+
+
+def test_record_tp_placed_at_entry():
+    b, _mc = _bot()
+    b._record_tp_placed({"sl": {}, "tp": {}}, "r9", place_tp=True)
+    assert state.get_meta(b.TP_PLACED_KEY) == "r9"
+    b._record_tp_placed({"sl": {}, "tp_error": "-2021"}, "r10", place_tp=True)
+    assert state.get_meta(b.TP_PLACED_KEY) == ""
+    b._record_tp_placed({"sl": {}}, "r11", place_tp=False)
+    assert state.get_meta(b.TP_PLACED_KEY) == ""
 
 
 def test_flat_then_open_resets_the_debounce():
