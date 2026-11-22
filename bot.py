@@ -2562,13 +2562,43 @@ class Bot:
             self.log.warning("unverified entry: position read failed: %s", e)
             return
         if pos.side == "flat" or not pos.qty:
-            if now - float(u.get("since") or 0) >= self.UNVERIFIED_SETTLE_S \
-                    and self.client.cancel_entry_order(self.symbol, root) is True:
-                self._clear_unverified()
-                self.log.warning("unverified entry %s: confirmed gone, nothing filled", root)
-                send_alert("Entry error resolved — nothing filled",
-                           f"The entry order {root} is confirmed gone and no position "
-                           f"opened. Entries resume.")
+            if now - float(u.get("since") or 0) < self.UNVERIFIED_SETTLE_S:
+                return
+            # G1 (2026-11 round 3): the lenient read above is ONE read, and
+            # cancel_entry_order() is True also when the order already FILLED.
+            # Clear only on a STRICT flat (account-endpoint backed), and say
+            # "nothing filled" only when the order's own filled qty proves it.
+            # The settle window is this site's debounce (it polls every
+            # UNVERIFIED_POLL_S, not every tick, so the tick debounce cannot
+            # apply).
+            flat_ok, seen = self._strict_flat_reads()
+            if not flat_ok:
+                self.log.warning("unverified entry %s: lenient flat NOT confirmed "
+                                 "(%s) — record kept, entries stay blocked", root, seen)
+                return
+            if self.client.cancel_entry_order(self.symbol, root) is not True:
+                return
+            filled = self.client.entry_order_filled(self.symbol, root)
+            tol = max(float(self.constraints.qty_step or 0.0) / 2, 1e-12)
+            if filled is None:
+                self.log.warning("unverified entry %s: flat confirmed but the order's "
+                                 "filled qty is unreadable — record kept", root)
+                return
+            self._clear_unverified()
+            if filled > tol:
+                self.log.error("unverified entry %s: it FILLED %.6f but the position "
+                               "is now confirmed flat — closed outside the ledger",
+                               root, filled)
+                send_alert("Entry error — the entry FILLED, position now flat",
+                           f"Entry {root} filled {filled:.6f} {self.base_asset}, but the "
+                           f"position is now confirmed flat (stop, TP, liquidation or a "
+                           f"manual close). The ledger may be missing this trade; "
+                           f"reconcile it from Binance. Entries resume.")
+                return
+            self.log.warning("unverified entry %s: confirmed gone, nothing filled", root)
+            send_alert("Entry error resolved — nothing filled",
+                       f"The entry order {root} is confirmed gone, it filled nothing, and "
+                       f"the position is confirmed flat. Entries resume.")
             return
         if u.get("retry_protect") and pos.side == u.get("side"):
             if self._protect_or_close_open(

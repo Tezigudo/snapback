@@ -395,14 +395,50 @@ class TestRedTeam2:
 
     def test_Fa_record_clears_only_after_the_settle_window(self) -> None:
         import time as _t
-        bot, _ex = self._donch_limit()
+        bot, ex = self._donch_limit()
         with patch("bot.send_alert"):
             _enter(bot)
+        ex.entry_filled = 0.0        # G1: the order's own filled qty proves "nothing"
         self._tick(bot, _t.time() + 10)
         assert state.get_meta("entry_unverified"), "cleared before settling"
         with patch("bot.send_alert"):
             self._tick(bot, _t.time() + 120)
         assert state.get_meta("entry_unverified") == ""
+
+    # --- G1 (round 3): never "nothing filled" on a lenient read or a filled order
+    def _settled(self, *, lag=0, filled=0.0):
+        import time as _t
+        bot, ex = self._donch_limit()
+        with patch("bot.send_alert"):
+            _enter(bot)
+        ex.pos = None
+        ex.entry_filled = filled
+        ex.position_lag_reads = lag
+        with patch("bot.send_alert") as alert:
+            self._tick(bot, _t.time() + 120)
+        return bot, ex, _subjects(alert)
+
+    def test_G1_lenient_flat_with_position_open_keeps_the_record(self) -> None:
+        import time as _t
+        bot, ex = self._donch_limit()
+        with patch("bot.send_alert"):
+            _enter(bot)
+        ex.pos = ("long", 0.005, 65000.0)
+        ex.position_lag_reads = 1        # the guard's lenient read says flat (stale)
+        with patch("bot.send_alert") as alert:
+            self._tick(bot, _t.time() + 120)
+        assert state.get_meta("entry_unverified"), "cleared on a stale flat"
+        assert not any("nothing filled" in s for s in _subjects(alert))
+
+    def test_G1_filled_entry_is_never_reported_as_nothing_filled(self) -> None:
+        _b, _ex, subjects = self._settled(filled=0.005)
+        assert not any("nothing filled" in s for s in subjects)
+        assert any("FILLED" in s for s in subjects)
+
+    def test_G1_unreadable_filled_qty_keeps_the_record(self) -> None:
+        _b, _ex, subjects = self._settled(filled=None)
+        assert state.get_meta("entry_unverified")
+        assert not any("nothing filled" in s for s in subjects)
 
     def _watching_with(self, pos, filled):
         import time as _t
