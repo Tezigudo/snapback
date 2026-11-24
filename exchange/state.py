@@ -66,12 +66,16 @@ Schema:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .env import REPO_ROOT
+
+# Child of the bot's "snapback" logger, so booked fills land in the leg's JSONL.
+_ledger_log = logging.getLogger("snapback.ledger")
 
 # Env-var override so a second bot instance (Donchian leg) can point at
 # data/state_donchian.db without code changes. Default matches the single-bot
@@ -201,6 +205,27 @@ def record_fill(side: str, qty: float, price: float, reason: str,
             (datetime.now(UTC).isoformat(), side, qty, price,
              pnl_usd, reason, equity_after, client_order_id_root),
         )
+    # One log line per booked fill, from the single place every fill is written.
+    # Before this, most close paths (bracket SL/TP, time-stop, trend-exit,
+    # confirmed close) logged only on FAILURE, so a clean exit left no trace in
+    # the leg's log (23-24 Nov 2026 SOL stop-out: entry logged, exit silent).
+    # Logging must never break booking: the row above is already committed.
+    try:
+        _ledger_log.info(
+            "fill booked: %s %s @ %s reason=%s pnl=%s equity_after=%s signal_id=%s",
+            side, _fmt_num(qty), _fmt_num(price), reason, _fmt_num(pnl_usd),
+            _fmt_num(equity_after), client_order_id_root or "-")
+    except Exception:
+        pass
+
+
+def _fmt_num(v: float | None) -> str:
+    if v is None:
+        return "-"
+    try:
+        return f"{float(v):.4f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def record_event(level: str, kind: str, msg: str | dict,

@@ -424,6 +424,10 @@ class Bot:
         # on what" without you SSHing in.
         self._latest_gates: dict | None = None
         self._last_waiting_for: str | None = None
+        # UTC ISO time of the evaluation that produced _latest_gates. Lets the
+        # heartbeat tell whether a FIRED snapshot has since been traded (see
+        # _gates_for_heartbeat).
+        self._gates_eval_ts: str | None = None
         # Last observed position side, used by _detect_bracket_exit to spot
         # open→flat transitions. "unknown" until the first loop call so we
         # don't emit a spurious exit alert for a historical entry in state.db.
@@ -976,6 +980,52 @@ class Bot:
             f"  Heartbeat      : {_rel_to_repo(HEARTBEAT)}\n"
         )
 
+    def _gates_for_heartbeat(self) -> dict | None:
+        """The gate snapshot to push, with a stale FIRED resolved.
+
+        Gates are only re-evaluated at a bar close while FLAT, so a snapshot
+        with `would_fire` set stays in every heartbeat for the whole trade and
+        after its exit, until the next evaluated bar. The dashboard then shows
+        "FIRED: LONG" with no position open (SOL, 23-24 Nov 2026: entered
+        23:00, stopped out 05:46, still "fired"). If a fill has been booked
+        since that evaluation, the signal has been acted on: clear
+        `would_fire`, keep it as `fired`, and say what happened in
+        `waiting_for`. No fill yet (order resting or entry skipped) keeps the
+        snapshot as is, because then "fired" is still the truth. Never raises.
+        """
+        g = self._latest_gates
+        eval_ts = getattr(self, "_gates_eval_ts", None)
+        if g is None or not g.get("would_fire") or not eval_ts:
+            return g
+        try:
+            with sqlite3.connect(state.DB_PATH) as c:
+                row = c.execute(
+                    "SELECT reason, price FROM fills WHERE ts >= ? "
+                    "AND reason NOT IN " + _SIZE_ROWS_SQL + " "
+                    "ORDER BY id DESC LIMIT 1",
+                    (eval_ts,),
+                ).fetchone()
+        except Exception:
+            return g
+        if row is None:
+            return g
+        reason, price = row
+        fired = g["would_fire"]
+        try:
+            at = f" @ {float(price):,.2f}"
+        except (TypeError, ValueError):
+            at = ""
+        out = dict(g)
+        out["would_fire"] = None
+        out["fired"] = fired
+        if reason == "entry":
+            out["waiting_for"] = (f"in position: {fired} (entered{at}); "
+                                  "gates re-check after the exit")
+        else:
+            out["waiting_for"] = (f"{fired} trade closed ({reason}{at}); "
+                                  "gates re-check at the next bar close")
+        return out
+
     def _maybe_push_consolidate(self, equity: float | None) -> None:
         """If enough time elapsed since last push: enqueue a heartbeat event
         and drain the outbox. Never blocks for more than the HTTP timeout
@@ -995,8 +1045,9 @@ class Bot:
             # can show "what's true now / waiting on what" without operator
             # intervention. Falls back to absent key when no bar has been
             # evaluated yet (first 5-10s of boot).
-            if self._latest_gates is not None:
-                payload["gates"] = self._latest_gates
+            gates = self._gates_for_heartbeat()
+            if gates is not None:
+                payload["gates"] = gates
             state.enqueue_bot_event(
                 "heartbeat",
                 equity_usd=float(equity) if equity is not None else None,
@@ -1706,6 +1757,7 @@ class Bot:
         # summary *changes*, to avoid spamming the JSONL with identical lines
         # bar after bar in long quiet stretches.
         self._latest_gates = gate_status(self.strategy_name, decision, self.params)
+        self._gates_eval_ts = datetime.now(UTC).isoformat()
         cur_waiting = self._latest_gates.get("waiting_for", "")
         if cur_waiting and cur_waiting != self._last_waiting_for:
             self.log.info("gates: %s", cur_waiting)
